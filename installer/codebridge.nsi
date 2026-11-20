@@ -23,9 +23,6 @@ ShowUninstDetails show
 !define MUI_ABORTWARNING
 !define MUI_ICON "${SOURCE_ROOT}\assets\codebridge.ico"
 !define MUI_UNICON "${SOURCE_ROOT}\assets\codebridge.ico"
-!define MUI_FINISHPAGE_RUN "$INSTDIR\runtime\python\pythonw.exe"
-!define MUI_FINISHPAGE_RUN_PARAMETERS '"$INSTDIR\installer\company_setup.py"'
-!define MUI_FINISHPAGE_RUN_TEXT "Configurar CodeBridge"
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
