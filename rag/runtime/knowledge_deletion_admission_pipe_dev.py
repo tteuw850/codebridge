@@ -1,0 +1,172 @@
+"""DEV-only one-shot Named Pipe precheck service, absolutely no deletion action.
+
+Uses the actual source NamedPipeServer and Windows connected client process
+token AccessCheck. The only opcode is PRECHECK and the result always carries
+activation_authorized=False. Intended for an isolated scratch process.
+"""
+from __future__ import annotations
+
+import ctypes
+from ctypes import wintypes
+import json
+import re
+import secrets
+import hmac
+from pathlib import Path
+import sys
+
+from rag.runtime.knowledge_deletion_scratch_pipe_peer_identity_dev import (
+    _client_pid, inspect_scratch_connected_peer_dev,
+)
+from rag.runtime.knowledge_deletion_scratch_peer_acl_dev import (
+    inspect_scratch_connected_peer_effective_access_dev,
+)
+from rag.runtime.knowledge_deletion_operational_admission_dev import (
+    review_operational_deletion_admission,
+)
+
+_APP = str(Path(__file__).resolve().parents[2]/"app_rewrite")
+if _APP not in sys.path:
+    sys.path.insert(0,_APP)
+from ipc_named_pipe import NamedPipeServer
+
+MAX_MESSAGE_BYTES = 8192
+_PIPE_PREFIX = r'\\.\pipe\CB.RAGDEL.ADMISSION.SCRATCH.'
+_PIPE_LEAF = re.compile(r'[0-9a-f]{32}\Z')
+
+def serve_one_deletion_admission_precheck_dev(
+    pipe_name: str, *, get_gui_witness, get_operational_inventory,
+    get_project_conflicts=None, get_server_review=None,
+    get_expected_peer_identity=None, now_epoch: int | None = None,
+) -> dict:
+    """One-shot scratch IPC handler. NOT installed in actual GUI."""
+    if (not isinstance(pipe_name,str) or not pipe_name.startswith(_PIPE_PREFIX)
+            or _PIPE_LEAF.fullmatch(pipe_name[len(_PIPE_PREFIX):]) is None):
+        raise ValueError("only randomized disposable admission pipes are permitted")
+    if not callable(get_gui_witness) or not callable(get_operational_inventory):
+        raise TypeError("trusted read-only server observers required")
+    with NamedPipeServer(pipe_name).accept() as connection:
+        client_pid=wintypes.ULONG()
+        if not _client_pid(connection._handle,ctypes.byref(client_pid)):
+            raise RuntimeError("unverifiable IPC kernel client")
+        peer=inspect_scratch_connected_peer_effective_access_dev(
+            connection, expected_client_pid=client_pid.value, desired_access=1
+        )
+        if peer["state"]!="SCRATCH_PEER_KERNEL_TOKEN_ACCESSCHECK_COMPLETE" or peer["access_granted"] is not True:
+            raise PermissionError("untrusted kernel connected peer")
+        # The kernel-reported PID is not, by itself, proof that this is the
+        # expected MCP peer. Pin it against an independently supplied DEV
+        # process snapshot when available; never accept identity from payload.
+        expected_peer = None
+        peer_identity = None
+        if get_expected_peer_identity is not None:
+            if not callable(get_expected_peer_identity):
+                raise TypeError("invalid expected peer identity observer")
+            expected_peer = get_expected_peer_identity()
+            if (type(expected_peer) is not dict
+                    or set(expected_peer) != {"pid", "birth"}
+                    or type(expected_peer.get("pid")) is not int
+                    or expected_peer["pid"] <= 0
+                    or type(expected_peer.get("birth")) is not int
+                    or expected_peer["birth"] <= 0):
+                raise ValueError("invalid expected peer identity")
+            peer_identity = inspect_scratch_connected_peer_dev(
+                connection, expected_client_pid=expected_peer["pid"],
+                expected_client_birth=expected_peer["birth"],
+            )
+        # Native kernel token check is complete before issuing a challenge.
+        # A freshly generated one-time challenge binds this request to the
+        # current connection. Replayed client payloads are never accepted.
+        challenge=secrets.token_hex(32)
+        connection.send(json.dumps({
+            "schema":"RAG_DEL_ADMISSION_PRECHECK_CHALLENGE_V1",
+            "challenge":challenge,
+            "read_only":True,
+        },sort_keys=True).encode("utf-8"))
+        raw=connection.receive(max_bytes=MAX_MESSAGE_BYTES)
+        if len(raw)>MAX_MESSAGE_BYTES:
+            raise ValueError("oversized request")
+        try:
+            message=json.loads(raw.decode("utf-8"))
+        except (UnicodeError,ValueError) as exc:
+            raise ValueError("invalid precheck request") from exc
+        if (type(message) is not dict
+                or type(message.get("challenge")) is not str
+                or not hmac.compare_digest(message["challenge"],challenge)):
+            raise ValueError("stale or mismatched admission challenge")
+        if (set(message)!={"schema","challenge","operation","request"}
+                or message.get("schema")!="RAG_DEL_ADMISSION_PRECHECK_REQUEST_V1"
+                or message["operation"]!="PRECHECK"):
+            result=dict(state="RAG_DEL_COMMAND_ADMISSION_BLOCKED",blockers=["UNSUPPORTED_OPERATION"],
+                        read_only=True,activation_authorized=False,
+                        deletion_enabled=False,operational_use_allowed=False)
+        else:
+            # Reject malformed request bodies before consulting any observer.
+            # This avoids turning hostile JSON types into callback exceptions
+            # or unnecessary reads of the operational queue/catalog.
+            request=message["request"]
+            if type(request) is not dict:
+                result=dict(
+                    state="RAG_DEL_COMMAND_ADMISSION_BLOCKED",
+                    blockers=["INVALID_RECEIPTS"],read_only=True,
+                    activation_authorized=False,deletion_enabled=False,
+                    operational_use_allowed=False,
+                )
+            else:
+                # The peer does not provide its own GUI or queue receipts.
+                scoped=None
+                if get_project_conflicts is not None:
+                    if not callable(get_project_conflicts):
+                        raise TypeError("invalid project conflict observer")
+                    try:
+                        scoped=get_project_conflicts(request.get("project_id"))
+                    except (ValueError,OSError,RuntimeError,TypeError):
+                        scoped={"state":"PROJECT_CONFLICT_REVIEW_UNAVAILABLE",
+                                "blockers":["PROJECT_REVIEW_UNAVAILABLE"]}
+                source_review=None
+                if get_server_review is not None:
+                    if not callable(get_server_review):
+                        raise TypeError("invalid server-side read-only review")
+                    try:
+                        source_review=get_server_review(
+                            request.get("project_id"),request.get("selected_paths")
+                        )
+                    except (ValueError,OSError,RuntimeError,TypeError):
+                        source_review={"state":"SERVER_REVIEW_UNAVAILABLE"}
+                try:
+                    inventory=get_operational_inventory()
+                except (ValueError,OSError,RuntimeError,TypeError):
+                    inventory={"read_only":True,"blockers":["OPERATIONAL_INVENTORY_UNAVAILABLE"]}
+                if not callable(get_gui_witness):
+                    raise TypeError("invalid GUI witness observer")
+                try:
+                    witness=get_gui_witness()
+                except (ValueError,OSError,RuntimeError,TypeError):
+                    witness={"state":"GUI_WITNESS_UNAVAILABLE"}
+                result=review_operational_deletion_admission(
+                    request,gui_witness=witness,
+                    operational_inventory=inventory,
+                    target_conflicts=scoped,server_review=source_review,
+                    now_epoch=now_epoch
+                )
+        result["kernel_connected_client_pid"]=client_pid.value
+        result["kernel_peer_accesscheck_complete"]=peer["access_check_completed"]
+        result["kernel_peer_identity_attested"] = bool(
+            peer_identity is not None
+            and peer_identity.get("state") == "SCRATCH_KERNEL_PEER_PID_BIRTH_OBSERVED"
+            and not peer_identity.get("blockers")
+        )
+        result["kernel_peer_identity"] = peer_identity or {
+            "state":"KERNEL_PEER_IDENTITY_NOT_PINNED", "read_only":True,
+            "observed_peer_pid":client_pid.value,
+            "activation_authorized":False, "operational_use_allowed":False,
+        }
+        if not result["kernel_peer_identity_attested"]:
+            result.setdefault("blockers", []).append("KERNEL_PEER_IDENTITY_NOT_PINNED")
+        result["activation_authorized"]=False
+        result["operational_use_allowed"]=False
+        result["deletion_enabled"]=False
+        connection.send(json.dumps(result,sort_keys=True).encode("utf-8"))
+        if connection.receive()!=b"CLOSE":
+            raise ValueError("bad client close handshake")
+        return result

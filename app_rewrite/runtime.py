@@ -1,0 +1,1328 @@
+import repo_path  # noqa: F401 - must run before any rag import
+import copy
+import json
+import os
+import secrets
+import threading
+import time
+
+from api_server import BridgeAPI
+from author_mcp_manager import AuthorMCPManager
+from secure_tunnel_manager import SecureTunnelManager
+from chatgpt_companion import ChatGPTCompanionServer, ChatGPTTimerState
+from claude_desktop_watcher import ClaudeDesktopWatcher
+from config_store import DEFAULT_TURN_TIMER_MODE, normalize_turn_timer_mode
+from rag_query_counter import RagQueryCounter
+from completion_sound import CompletionSound
+from constants import APP_NAME, APP_VERSION, DATA_DIR, DEFAULT_HOST, RUNTIME_FILE
+from executor import ExecutionEngine
+from external_prepare_store import ExternalPrepareStore, ExternalPrepareConflict, command_hash
+from external_execute_store import ExternalExecuteStore, ExternalExecuteConflict
+from execution_ledger import ExecutionLedger, ExecutionLedgerConflict
+from job_store import JobStore
+from migration import migrate_legacy_ssh_once
+from read_only_batch import execute_read_only_batch
+from terminal_manager import TerminalManager
+
+# Fecha o turno do contador quando o cliente (Claude, ChatGPT...) fica
+# este tempo sem chamar o CodeBridge: a resposta anterior terminou.
+CHATGPT_TURN_IDLE_GAP_SECONDS = 90.0
+# Se uma requisicao nunca encerrar a atividade, nao trava o contador.
+CHATGPT_TURN_INFLIGHT_STALE_SECONDS = 600.0
+
+
+class BridgeRuntime:
+    STATUS_AVAILABILITY_CACHE_TTL_SECONDS = 0.5
+
+    def __init__(self):
+        self.store = JobStore()
+        self.terminals = TerminalManager()
+        self.instance_id = secrets.token_hex(16)
+        self.external_prepares = ExternalPrepareStore(DATA_DIR / 'author_prepared.db')
+        self.external_executions = ExternalExecuteStore(DATA_DIR / 'author_executions.db')
+        self.execution_ledger = ExecutionLedger(DATA_DIR / 'executions_v2.db')
+        self._phase5b_lock = threading.RLock()
+        self._phase5b_workers = {}
+        self._phase5b_active_execution_id = None
+        # Texto do comando em execucao, so em memoria (nao vai para o disco).
+        self._phase5b_active_command = None
+        self._execution_signal_condition = threading.Condition(
+            threading.RLock()
+        )
+        self._execution_signal_generation = 0
+        self._external_prepare_lock = threading.RLock()
+        self._external_prepared_request_id = None
+        self._external_prepared_target = None
+        self._external_prepared_command = None
+        self._external_workers_lock = threading.RLock()
+        self._external_workers = {}
+        self._availability_cache_lock = threading.RLock()
+        self._availability_cache = None
+        self._availability_cache_at = 0.0
+        self.auto_execute = self.terminals.config.load_auto_execute()
+        self.auto_preview_seconds = 0.35
+        self.completion_sound = CompletionSound(
+            self.terminals.config
+        )
+        self.engine = ExecutionEngine(
+            self.store,
+            self.terminals,
+        )
+        self.author_mcp = AuthorMCPManager()
+        self.secure_tunnel = SecureTunnelManager()
+        self._turn_activity_lock = threading.RLock()
+        self._turn_inflight = 0
+        self._turn_last_activity = None
+        self.chatgpt_timer = ChatGPTTimerState(
+            on_finished=self._on_chatgpt_timer_finished
+        )
+        self.chatgpt_companion = ChatGPTCompanionServer(
+            self.chatgpt_timer
+        )
+        self.rag_queries = RagQueryCounter()
+        self.turn_timer_mode = (
+            self.terminals.config.load_turn_timer_mode()
+        )
+        self.claude_watcher = ClaudeDesktopWatcher(
+            on_response_finished=self._on_claude_response_finished
+        )
+        self.token = secrets.token_urlsafe(32)
+        self.api = BridgeAPI(self, host=DEFAULT_HOST, port=0, token=self.token)
+        self.started_at = None
+        self._started = False
+
+    @property
+    def started(self):
+        return self._started
+
+    def _invalidate_availability_cache(self):
+        with self._availability_cache_lock:
+            self._availability_cache = None
+            self._availability_cache_at = 0.0
+
+    def _availability_status(self):
+        now = time.monotonic()
+        with self._availability_cache_lock:
+            if (
+                self._availability_cache is not None
+                and (
+                    now - self._availability_cache_at
+                    < self.STATUS_AVAILABILITY_CACHE_TTL_SECONDS
+                )
+            ):
+                return copy.deepcopy(
+                    self._availability_cache
+                )
+
+        fresh = {
+            "author_mcp": self.author_mcp.status(),
+            "secure_tunnel": self.secure_tunnel.status(),
+        }
+        with self._availability_cache_lock:
+            self._availability_cache = copy.deepcopy(fresh)
+            self._availability_cache_at = now
+        return fresh
+
+    def start(self):
+        if self._started:
+            return False
+
+        self._invalidate_availability_cache()
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        migrate_legacy_ssh_once()
+        self.external_executions.recover_stale(self.instance_id)
+        self.execution_ledger.interrupt_incomplete_from_other_runtime(self.instance_id)
+
+        self.terminals.start()
+        self.engine.start()
+        self.api.start()
+        self.chatgpt_companion.start()
+
+        self.started_at = time.time()
+        self._started = True
+        self._write_runtime_file()
+        self._sync_claude_watcher()
+        self.author_mcp.start()
+        self.secure_tunnel.start()
+        self._invalidate_availability_cache()
+        return True
+
+    def _write_runtime_file(self):
+        payload = {
+            "app": APP_NAME,
+            "version": APP_VERSION,
+            "pid": os.getpid(),
+            "host": self.api.host,
+            "port": self.api.port,
+            "token": self.token,
+            "started_at": self.started_at,
+            "chatgpt_companion": {
+                "host": self.chatgpt_companion.host,
+                "port": self.chatgpt_companion.port,
+            },
+        }
+        temp = RUNTIME_FILE.with_suffix(".tmp")
+        temp.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temp.replace(RUNTIME_FILE)
+
+    def set_auto_execute(self, enabled):
+        self.auto_execute = bool(enabled)
+        self.terminals.config.save_auto_execute(self.auto_execute)
+        return self.auto_execute
+
+    def toggle_completion_sound(self):
+        return self.completion_sound.toggle()
+
+    def _chatgpt_turn_activity_lock(self):
+        lock = getattr(self, "_turn_activity_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._turn_activity_lock = lock
+        return lock
+
+    def ensure_chatgpt_turn(
+        self,
+        reason="codebridge_call",
+        track_activity=False,
+        now=None,
+    ):
+        with self._chatgpt_turn_activity_lock():
+            now = time.monotonic() if now is None else float(now)
+            inflight = int(getattr(self, "_turn_inflight", 0) or 0)
+            last_activity = getattr(self, "_turn_last_activity", None)
+            snapshot = self.chatgpt_timer.snapshot()
+            idle_closed_request_id = None
+            mode = getattr(
+                self, "turn_timer_mode", DEFAULT_TURN_TIMER_MODE
+            )
+
+            if mode == "DISABLED":
+                return {
+                    "started": False,
+                    "timer": snapshot,
+                    "disabled": True,
+                }
+
+            if snapshot.get("state") == "RUNNING":
+                gap = (
+                    None
+                    if last_activity is None
+                    else now - last_activity
+                )
+                idle = mode == "CLAUDE" and gap is not None and (
+                    (
+                        inflight == 0
+                        and gap >= CHATGPT_TURN_IDLE_GAP_SECONDS
+                    )
+                    or gap >= CHATGPT_TURN_INFLIGHT_STALE_SECONDS
+                )
+                if not idle:
+                    self._turn_last_activity = now
+                    if track_activity:
+                        self._turn_inflight = inflight + 1
+                    return {
+                        "started": False,
+                        "timer": snapshot,
+                    }
+
+                idle_closed_request_id = snapshot.get("request_id")
+                self.chatgpt_timer.finish(
+                    idle_closed_request_id,
+                    notify=False,
+                )
+                inflight = 0
+
+            request_id = (
+                "codebridge_"
+                + secrets.token_hex(8)
+            )
+            self.chatgpt_timer.start(
+                request_id,
+                resume_manual=True,
+            )
+            self.chatgpt_timer.claim(
+                reason=reason,
+                request_id=request_id,
+            )
+            self._turn_last_activity = now
+            self._turn_inflight = (
+                inflight + 1 if track_activity else inflight
+            )
+
+            return {
+                "started": True,
+                "timer": self.chatgpt_timer.snapshot(),
+                "idle_closed_request_id": idle_closed_request_id,
+            }
+
+    def _sync_claude_watcher(self):
+        watcher = getattr(self, "claude_watcher", None)
+        if watcher is None:
+            return False
+        should_run = bool(getattr(self, "_started", False)) and (
+            getattr(self, "turn_timer_mode", DEFAULT_TURN_TIMER_MODE)
+            == "CLAUDE"
+        )
+        try:
+            if should_run:
+                watcher.start()
+            else:
+                watcher.stop()
+        except Exception:
+            return False
+        return should_run
+
+    def _rag_counter(self):
+        counter = getattr(self, "rag_queries", None)
+        if counter is None:
+            counter = self.rag_queries = RagQueryCounter()
+        return counter
+
+    def _rag_timer_enabled(self):
+        mode = getattr(self, "turn_timer_mode", DEFAULT_TURN_TIMER_MODE)
+        return str(mode or "").upper() != "DISABLED"
+
+    def record_rag_query(self, source="MCP"):
+        key = None
+        if self._rag_timer_enabled():
+            timer = self.chatgpt_timer.snapshot()
+            if str(timer.get("state") or "").upper() == "RUNNING":
+                key = timer.get("request_id")
+        return self._rag_counter().record(source, key)
+
+    def rag_query_counts(self):
+        key = None
+        if self._rag_timer_enabled():
+            key = self.chatgpt_timer.snapshot().get("request_id")
+        return self._rag_counter().snapshot(key)
+
+    def set_turn_timer_mode(self, mode):
+        mode = normalize_turn_timer_mode(mode)
+        with self._chatgpt_turn_activity_lock():
+            previous = getattr(
+                self, "turn_timer_mode", DEFAULT_TURN_TIMER_MODE
+            )
+            self.terminals.config.save_turn_timer_mode(mode)
+            self.turn_timer_mode = mode
+            if mode != previous:
+                self.chatgpt_timer.reset()
+                self._turn_last_activity = None
+        self._sync_claude_watcher()
+        return mode
+
+    def _on_claude_response_finished(self):
+        with self._chatgpt_turn_activity_lock():
+            mode = getattr(
+                self, "turn_timer_mode", DEFAULT_TURN_TIMER_MODE
+            )
+            if mode != "CLAUDE":
+                return False
+            snapshot = self.chatgpt_timer.snapshot()
+            if (
+                snapshot.get("state") != "RUNNING"
+                or not snapshot.get("claimed_by_codebridge")
+            ):
+                return False
+            result = self.chatgpt_timer.finish(
+                snapshot.get("request_id")
+            )
+            self._turn_last_activity = None
+            return bool(result.get("applied"))
+
+    def end_chatgpt_activity(self, now=None):
+        with self._chatgpt_turn_activity_lock():
+            now = time.monotonic() if now is None else float(now)
+            inflight = int(getattr(self, "_turn_inflight", 0) or 0)
+            self._turn_inflight = max(0, inflight - 1)
+            self._turn_last_activity = now
+
+    def begin_local_ai_turn(self):
+        """Um pedido da IA Local conta no cronometro de turno (modo ChatGPT ou Claude).
+
+        Desabilitado: nao conta (None). Se Claude/ChatGPT ja esta num turno ativo,
+        a IA Local soma nele ("") em vez de abrir outro. Se abriu um turno novo,
+        devolve o request_id dele, para fechar em end_local_ai_turn.
+        """
+        result = self.ensure_chatgpt_turn(reason="local_ai", track_activity=True)
+        if result.get("disabled"):
+            return None
+        if result.get("started"):
+            return str((result.get("timer") or {}).get("request_id") or "")
+        return ""
+
+    def end_local_ai_turn(self, request_id, cancelled=False):
+        """Fecha o turno aberto pela IA Local (Parar vira cancelado)."""
+        if request_id is None:
+            return False
+        with self._chatgpt_turn_activity_lock():
+            self.end_chatgpt_activity()
+            if not request_id:
+                return False
+            if cancelled:
+                result = self.chatgpt_timer.cancel(request_id)
+            else:
+                result = self.chatgpt_timer.finish(request_id, notify=False)
+            if result.get("applied"):
+                self._turn_last_activity = None
+            return bool(result.get("applied"))
+
+    def _on_chatgpt_timer_finished(
+        self,
+        request_id,
+        timer,
+    ):
+        if timer.get("state") != "FINISHED":
+            return False
+        completion_id = (
+            "chatgpt:"
+            + str(request_id or "unknown")
+        )
+        return self.completion_sound.notify(
+            completion_id,
+            "FINISHED",
+            "CHATGPT",
+        )
+
+    def dispatch_external(self, request_id, target, command):
+        request_id = str(request_id or "").strip()
+        if not request_id:
+            raise ValueError("request_id obrigatorio")
+        target = self.terminals.normalize_target(target)
+        if not isinstance(command, str) or not command.strip() or "\x00" in command:
+            raise ValueError("command invalido")
+
+        digest = command_hash(command)
+        previous_prepare = self.external_prepares.get(request_id)
+        if previous_prepare is not None:
+            if previous_prepare["target"] != target or previous_prepare["command_hash"] != digest:
+                raise ExternalPrepareConflict("request_id reutilizado com target/comando diferente")
+        previous_execution = self.external_executions.get_by_prepared(request_id)
+        if previous_execution is not None:
+            state = previous_execution["state"]
+            if state in ("FINISHED", "FAILED"):
+                prepared = self._external_prepare_result(previous_prepare, duplicate=True) if previous_prepare else {
+                    "request_id": request_id, "target": target, "command_hash": digest,
+                    "state": "ALREADY_EXECUTED", "prepared_at": None,
+                    "duplicate": True, "enter_sent": True,
+                }
+                prepared["enter_sent"] = True
+                return {
+                    "mode": "REPLAY",
+                    "auto_execute": bool(self.auto_execute),
+                    "preview_seconds": self.auto_preview_seconds,
+                    "prepared": prepared,
+                    "execution": self._external_execution_result(previous_execution, duplicate=True),
+                }
+            raise RuntimeError("estado de execucao incerto; comando nao sera repetido automaticamente")
+
+        auto = bool(self.auto_execute)
+        prepared = self.prepare_external(request_id, target, command)
+        result = {
+            "mode": "AUTO" if auto else "MANUAL",
+            "auto_execute": auto,
+            "preview_seconds": self.auto_preview_seconds,
+            "prepared": prepared,
+            "execution": None,
+        }
+        if not auto:
+            return result
+        time.sleep(self.auto_preview_seconds)
+        result["execution"] = self.execute_external(f"{request_id}__execute", request_id)
+        return result
+
+    def start_external_async(self, request_id, target, command):
+        request_id = str(request_id or "").strip()
+        if not request_id:
+            raise ValueError("request_id obrigatorio")
+        target = self.terminals.normalize_target(target)
+        if not isinstance(command, str) or not command.strip() or "\x00" in command:
+            raise ValueError("command invalido")
+        digest = command_hash(command)
+        previous = self.external_executions.get_by_prepared(request_id)
+        if previous is not None:
+            if previous["target"] != target or previous["command_hash"] != digest:
+                raise ExternalExecuteConflict("request_id associado a outro target/comando")
+            prepared_row = self.external_prepares.get(request_id)
+            prepared = self._external_prepare_result(prepared_row, duplicate=True) if prepared_row else {
+                "request_id": request_id, "target": target, "command_hash": digest,
+                "state": "ALREADY_EXECUTED", "prepared_at": None, "duplicate": True,
+                "enter_sent": previous["state"] in ("EXECUTING", "FINISHED", "FAILED"),
+            }
+            return {"mode": "REPLAY", "auto_execute": bool(self.auto_execute),
+                    "preview_seconds": self.auto_preview_seconds, "prepared": prepared,
+                    "execution": self._external_execution_result(previous, duplicate=True)}
+        prepared = self.prepare_external(request_id, target, command)
+        execution_id = f"{request_id}__execute"
+        if not self.auto_execute:
+            return {"mode": "MANUAL", "auto_execute": False,
+                    "preview_seconds": self.auto_preview_seconds, "prepared": prepared,
+                    "execution": {"execution_request_id": execution_id,
+                                  "prepared_request_id": request_id, "target": target,
+                                  "command_hash": digest, "state": "PREPARED",
+                                  "duplicate": False, "enter_sent": False}}
+        with self._external_prepare_lock:
+            row, created = self.external_executions.reserve(
+                execution_id, request_id, target, digest, self.instance_id
+            )
+        if created:
+            worker = threading.Thread(
+                target=self._run_external_async,
+                args=(execution_id, request_id, target, command, self.auto_preview_seconds),
+                name=f"CodeBridgeAsync-{execution_id[-12:]}", daemon=True,
+            )
+            with self._external_workers_lock:
+                self._external_workers[execution_id] = worker
+            worker.start()
+        return {"mode": "ASYNC", "auto_execute": True,
+                "preview_seconds": self.auto_preview_seconds, "prepared": prepared,
+                "execution": self._external_execution_result(row, duplicate=not created)}
+
+    def _run_external_async(self, execution_id, prepared_request_id, target, command, delay):
+        try:
+            if delay > 0:
+                time.sleep(delay)
+            with self._external_prepare_lock:
+                row = self.external_executions.get_by_execution(execution_id)
+                if row is None or row["state"] != "RESERVED":
+                    return
+                if self._external_prepared_request_id != prepared_request_id:
+                    self.external_executions.mark_failed(
+                        execution_id, error_type="PreparedStateLost",
+                        error_message="comando preparado nao esta mais ativo; Enter nao foi enviado"
+                    )
+                    return
+                self.external_executions.mark_executing(execution_id, self.instance_id)
+                def capture(text):
+                    self.external_executions.append_output(execution_id, text)
+                try:
+                    output = self.terminals.execute_prepared(target, command, on_output=capture)
+                    self.external_executions.mark_finished(execution_id, output=output, exit_code=0)
+
+                except Exception as exc:
+                    self.external_executions.mark_failed(
+                        execution_id, output=getattr(exc, "output", "") or "",
+                        exit_code=getattr(exc, "exit_code", None),
+                        error_type=type(exc).__name__, error_message=str(exc),
+                    )
+                finally:
+                    self._external_prepared_request_id = None
+                    self._external_prepared_target = None
+                    self._external_prepared_command = None
+        finally:
+            with self._external_workers_lock:
+                self._external_workers.pop(execution_id, None)
+
+    def execution_status_external(self, execution_id, cursor=0, max_chars=65536):
+        execution_id = str(execution_id or "").strip()
+        if not execution_id:
+            raise ValueError("execution_id obrigatorio")
+        row = self.external_executions.get_by_execution(execution_id)
+        if row is None:
+            raise ValueError("execution_id nao encontrado")
+        delta = self.external_executions.read_output(execution_id, cursor, max_chars)
+        result = self._external_execution_result(row, duplicate=False)
+        result["output_delta"] = delta["text"]
+        result["output_cursor"] = delta["cursor"]
+        result["output_has_more"] = delta["has_more"]
+        result["complete"] = row["state"] in ("FINISHED", "FAILED")
+        return result
+
+    def _signal_execution_change(self):
+        with self._execution_signal_condition:
+            self._execution_signal_generation += 1
+            self._execution_signal_condition.notify_all()
+
+    def _execution_signal_snapshot(self):
+        with self._execution_signal_condition:
+            return self._execution_signal_generation
+
+    def _wait_for_execution_change(self, generation, timeout_seconds):
+        timeout_seconds = max(
+            0.0,
+            float(timeout_seconds or 0.0),
+        )
+        with self._execution_signal_condition:
+            if self._execution_signal_generation != generation:
+                return True
+            return self._execution_signal_condition.wait_for(
+                lambda: (
+                    self._execution_signal_generation
+                    != generation
+                ),
+                timeout=timeout_seconds,
+            )
+
+    def read_only_batch(self, operations):
+        return execute_read_only_batch(operations)
+
+
+    def start_phase5b_local(self, request_id, target, command):
+        request_id = str(request_id or "").strip()
+        if not request_id:
+            raise ValueError("request_id obrigatorio")
+        target = self.terminals.normalize_target(target)
+        if not isinstance(command, str) or not command.strip() or "\x00" in command:
+            raise ValueError("command invalido")
+        digest = command_hash(command)
+        with self._phase5b_lock:
+            existing = self.execution_ledger.get_by_request(request_id)
+            if existing is not None:
+                if existing["target"] != target or existing["command_hash"] != digest:
+                    raise ExecutionLedgerConflict("request_id reutilizado com target/comando diferente")
+                result = dict(existing); result["duplicate"] = True
+                return result
+            status = self.terminals.status()
+            if status.get("active_target") or status.get("prepared_target"):
+                raise RuntimeError("terminal ocupado ou ja possui comando preparado")
+            execution_id = "exec_" + secrets.token_hex(16)
+            row, _ = self.execution_ledger.create(
+                execution_id,
+                request_id,
+                target,
+                digest,
+                self.instance_id,
+                failed_command=command,
+            )
+            try:
+                self.terminals.prepare(target, command)
+            except Exception as exc:
+                self.execution_ledger.transition(
+                    execution_id,
+                    "FAILED",
+                    runtime_instance=self.instance_id,
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+                self._signal_execution_change()
+                raise
+            worker = threading.Thread(target=self._run_phase5b_local, args=(execution_id, target, command), name=f"CodeBridgeV2-{execution_id[-10:]}", daemon=True)
+            self._phase5b_workers[execution_id] = worker
+            worker.start()
+            result = dict(row); result["duplicate"] = False
+            return result
+
+    def _run_phase5b_local(self, execution_id, target, command):
+        try:
+            if self.auto_preview_seconds > 0:
+                time.sleep(self.auto_preview_seconds)
+            with self._phase5b_lock:
+                row = self.execution_ledger.get(execution_id)
+                if row is None or row["state"] != "CREATED":
+                    return
+                self.execution_ledger.transition(execution_id, "RUNNING", runtime_instance=self.instance_id)
+                self._phase5b_active_execution_id = execution_id
+                self._phase5b_active_command = (execution_id, str(command or "")[:20000], time.time())
+            def capture_output(text):
+                self.execution_ledger.append_output(
+                    execution_id,
+                    text,
+                )
+                self._signal_execution_change()
+            try:
+                output = self.terminals.execute_prepared(target, command, on_output=capture_output)
+                self.execution_ledger.sync_output(
+                    execution_id,
+                    output,
+                )
+                self.execution_ledger.transition(
+                    execution_id,
+                    "FINISHED",
+                    runtime_instance=self.instance_id,
+                    exit_code=0,
+                    output=output,
+                )
+                self._signal_execution_change()
+
+            except Exception as exc:
+                output = getattr(exc, "output", "") or ""
+                self.execution_ledger.sync_output(execution_id, output)
+                cancelled = "cancel" in type(exc).__name__.lower()
+                terminal_state = (
+                    "CANCELLED"
+                    if cancelled
+                    else "FAILED"
+                )
+                self.execution_ledger.transition(
+                    execution_id,
+                    terminal_state,
+                    runtime_instance=self.instance_id,
+                    exit_code=getattr(exc, "exit_code", None),
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                    output=output,
+                )
+                self._signal_execution_change()
+        finally:
+            with self._phase5b_lock:
+                self._phase5b_workers.pop(execution_id, None)
+                if self._phase5b_active_execution_id == execution_id:
+                    self._phase5b_active_execution_id = None
+                if (getattr(self, "_phase5b_active_command", None) or (None,))[0] == execution_id:
+                    self._phase5b_active_command = None
+
+    def phase5c_execution_status(self, execution_id):
+        execution_id = str(execution_id or "").strip()
+        if not execution_id:
+            raise ValueError("execution_id obrigatorio")
+        row = self.execution_ledger.get(execution_id)
+        if row is None:
+            raise KeyError(execution_id)
+        return {
+            "execution_id": row["execution_id"],
+            "request_id": row["request_id"],
+            "target": row["target"],
+            "state": row["state"],
+            "started_at": row.get("started_at"),
+            "finished_at": row.get("finished_at"),
+            "complete": row["state"] in ("FINISHED", "FAILED", "CANCELLED", "INTERRUPTED"),
+        }
+
+    def phase5c_execution_result(self, execution_id):
+        execution_id = str(execution_id or "").strip()
+        if not execution_id:
+            raise ValueError("execution_id obrigatorio")
+        row = self.execution_ledger.get(execution_id)
+        if row is None:
+            raise KeyError(execution_id)
+        terminal = row["state"] in ("FINISHED", "FAILED", "CANCELLED", "INTERRUPTED")
+        terminal_status = self.terminals.status()
+        terminal_key = {
+            "POWERSHELL5.1": "powershell",
+            "CMD": "cmd",
+            "SSH": "ssh",
+        }.get(row["target"])
+        shell_state = terminal_status.get(terminal_key) if terminal_key else None
+        shell_alive = (
+            bool(shell_state.get("online"))
+            if isinstance(shell_state, dict)
+            else None
+        )
+        return {
+            "execution_id": row["execution_id"],
+            "target": row["target"],
+            "state": row["state"],
+            "ready": terminal,
+            "output": row.get("output") or "" if terminal else "",
+            "exit_code": row.get("exit_code") if terminal else None,
+            "error_type": row.get("error_type") if terminal else None,
+            "error_message": row.get("error_message") if terminal else None,
+            "failed_command": (
+                (row.get("failed_command") or None)
+                if terminal and row["state"] != "FINISHED"
+                else None
+            ),
+            "shell_alive": shell_alive,
+            "execution_recoverable": True,
+            "started_at": row.get("started_at"),
+            "finished_at": row.get("finished_at") if terminal else None,
+        }
+
+    def phase5f_execution_output(self, execution_id, cursor=0, max_chars=32768):
+        execution_id = str(execution_id or "").strip()
+        if not execution_id:
+            raise ValueError("execution_id obrigatorio")
+        result = self.execution_ledger.read_output(
+            execution_id,
+            cursor=cursor,
+            max_chars=max_chars,
+        )
+        terminal_status = self.terminals.status()
+        terminal_key = {
+            "POWERSHELL5.1": "powershell",
+            "CMD": "cmd",
+            "SSH": "ssh",
+        }.get(result.get("target"))
+        shell_state = terminal_status.get(terminal_key) if terminal_key else None
+        result["shell_alive"] = (
+            bool(shell_state.get("online"))
+            if isinstance(shell_state, dict)
+            else None
+        )
+        result["execution_recoverable"] = True
+        return result
+
+    def phase5f_wait_execution_output(
+        self,
+        execution_id,
+        cursor=0,
+        max_chars=32768,
+        timeout_ms=15000,
+    ):
+        execution_id = str(execution_id or "").strip()
+        if not execution_id:
+            raise ValueError("execution_id obrigatorio")
+        cursor = max(0, int(cursor or 0))
+        max_chars = max(
+            1,
+            min(int(max_chars or 32768), 262144),
+        )
+        timeout_ms = max(
+            0,
+            min(int(timeout_ms or 0), 120000),
+        )
+        deadline = time.monotonic() + (
+            timeout_ms / 1000.0
+        )
+
+        while True:
+            generation = self._execution_signal_snapshot()
+            result = self.phase5f_execution_output(
+                execution_id,
+                cursor=cursor,
+                max_chars=max_chars,
+            )
+            has_event = bool(
+                result.get("text")
+                or result.get("has_more")
+                or result.get("complete")
+            )
+            if has_event:
+                result["timed_out"] = False
+                result["wait_mode"] = "EVENT"
+                return result
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                result["timed_out"] = True
+                result["wait_mode"] = "EVENT"
+                return result
+
+            signaled = self._wait_for_execution_change(
+                generation,
+                remaining,
+            )
+            if not signaled:
+                # One final read closes the boundary race at timeout.
+                result = self.phase5f_execution_output(
+                    execution_id,
+                    cursor=cursor,
+                    max_chars=max_chars,
+                )
+                result["timed_out"] = not bool(
+                    result.get("text")
+                    or result.get("has_more")
+                    or result.get("complete")
+                )
+                result["wait_mode"] = "EVENT"
+                return result
+
+    def stop_phase5d_execution(self, execution_id):
+        execution_id = str(execution_id or "").strip()
+        if not execution_id:
+            raise ValueError("execution_id obrigatorio")
+        with self._phase5b_lock:
+            row = self.execution_ledger.get(execution_id)
+            if row is None:
+                raise KeyError(execution_id)
+            state = row["state"]
+            if state in ("FINISHED", "FAILED", "CANCELLED", "INTERRUPTED"):
+                return {"execution_id": execution_id, "cancelled": False, "state": state, "reason": "already_terminal"}
+            target = self.terminals.normalize_target(row["target"])
+            if state == "CREATED":
+                if execution_id not in self._phase5b_workers:
+                    raise RuntimeError("execucao CREATED sem worker associado")
+                if self.terminals.status().get("prepared_target") != target:
+                    raise RuntimeError("execucao CREATED nao corresponde ao comando preparado")
+                if not self.terminals.discard_prepared():
+                    raise RuntimeError("nao foi possivel descartar comando preparado")
+                row = self.execution_ledger.transition(
+                    execution_id,
+                    "CANCELLED",
+                    runtime_instance=self.instance_id,
+                    error_type="ExecutionCancelledBeforeStart",
+                    error_message=(
+                        "execucao cancelada antes do Enter"
+                    ),
+                )
+                self._signal_execution_change()
+                return {
+                    "execution_id": execution_id,
+                    "cancelled": True,
+                    "state": row["state"],
+                    "reason": "cancelled_before_start",
+                }
+            if state != "RUNNING":
+                raise RuntimeError(f"estado nao cancelavel: {state}")
+            if self._phase5b_active_execution_id != execution_id:
+                raise RuntimeError("execution_id nao corresponde a execucao ativa")
+            cancelled = bool(self.terminals.cancel_active())
+            return {"execution_id": execution_id, "cancelled": cancelled, "state": "RUNNING", "reason": "ctrl_c_sent" if cancelled else "cancel_failed"}
+
+    def submit(self, target, command):
+        target = self.terminals.normalize_target(target)
+        job = self.store.create(target, command)
+        return job
+
+    def prepare_external(self, request_id, target, command):
+        request_id = str(request_id or "").strip()
+        if not request_id:
+            raise ValueError("request_id obrigatorio")
+        target = self.terminals.normalize_target(target)
+        if not isinstance(command, str) or not command.strip() or "\x00" in command:
+            raise ValueError("command invalido")
+
+        with self._external_prepare_lock:
+            row, created = self.external_prepares.reserve(
+                request_id, target, command, self.instance_id
+            )
+            status = self.terminals.status()
+            same_runtime = row["runtime_instance"] == self.instance_id
+            if not created and same_runtime:
+                if row["state"] == "PREPARED" and status.get("prepared_target") == target:
+                    self._external_prepared_request_id = request_id
+                    self._external_prepared_target = target
+                    self._external_prepared_command = command
+                    return self._external_prepare_result(row, duplicate=True)
+                if row["state"] in ("PREPARING", "PREPARED"):
+                    raise RuntimeError(
+                        "estado de preparacao incerto; comando nao sera repetido automaticamente"
+                    )
+            elif not created and not same_runtime:
+                row = self.external_prepares.reset_for_new_runtime(
+                    request_id, self.instance_id
+                )
+
+            status = self.terminals.status()
+            if status.get("active_target") or status.get("prepared_target"):
+                raise RuntimeError("terminal ocupado ou ja possui comando preparado")
+            self.external_prepares.mark_preparing(request_id, self.instance_id)
+            try:
+                self.terminals.prepare(target, command)
+            except Exception as exc:
+                self.external_prepares.mark_failed(request_id, str(exc))
+                raise
+            row = self.external_prepares.mark_prepared(request_id, self.instance_id)
+            self._external_prepared_request_id = request_id
+            self._external_prepared_target = target
+            self._external_prepared_command = command
+            return self._external_prepare_result(row, duplicate=False)
+
+    @staticmethod
+    def _external_prepare_result(row, duplicate=False):
+        return {
+            "request_id": row["request_id"],
+            "target": row["target"],
+            "command_hash": row["command_hash"],
+            "state": row["state"],
+            "prepared_at": row.get("prepared_at"),
+            "duplicate": bool(duplicate),
+            "enter_sent": False,
+        }
+
+    def discard_external(self, request_id=None):
+        with self._external_prepare_lock:
+            status = self.terminals.status()
+            if any(bool((status.get(name) or {}).get("executing")) for name in ("powershell", "cmd", "ssh")):
+                raise RuntimeError("comando em execucao; use stop em vez de discard")
+            active_id = self._external_prepared_request_id
+            if active_id is None:
+                return {"discarded": False, "reason": "no_external_prepared_command"}
+            if request_id and str(request_id) != active_id:
+                raise RuntimeError("request_id nao corresponde ao comando preparado")
+            discarded = bool(self.terminals.discard_prepared())
+            if discarded:
+                self.external_prepares.mark_discarded(active_id)
+                self._external_prepared_request_id = None
+                self._external_prepared_target = None
+                self._external_prepared_command = None
+            return {"discarded": discarded, "request_id": active_id}
+
+    def execute_external(self, execution_request_id, prepared_request_id):
+        execution_request_id = str(execution_request_id or "").strip()
+        prepared_request_id = str(prepared_request_id or "").strip()
+        if not execution_request_id or not prepared_request_id:
+            raise ValueError("execution_request_id e prepared_request_id obrigatorios")
+        with self._external_prepare_lock:
+            existing = self.external_executions.get_by_prepared(prepared_request_id)
+            if self._external_prepared_request_id != prepared_request_id:
+                if existing and existing["state"] in ("FINISHED", "FAILED"):
+                    return self._external_execution_result(existing, duplicate=True)
+                raise RuntimeError("prepared_request_id nao corresponde ao comando preparado")
+            target = self._external_prepared_target
+            command = self._external_prepared_command
+            if not target or not command:
+                raise RuntimeError("metadados do comando preparado indisponiveis")
+            row, created = self.external_executions.reserve(
+                execution_request_id, prepared_request_id, target,
+                command_hash(command), self.instance_id,
+            )
+            if not created:
+                if row["state"] in ("FINISHED", "FAILED"):
+                    return self._external_execution_result(row, duplicate=True)
+                raise RuntimeError(
+                    "estado de execucao incerto; Enter nao sera repetido automaticamente"
+                )
+            self.external_executions.mark_executing(execution_request_id, self.instance_id)
+            try:
+                output = self.terminals.execute_prepared(target, command)
+                row = self.external_executions.mark_finished(
+                    execution_request_id, output=output, exit_code=0
+                )
+
+            except Exception as exc:
+                row = self.external_executions.mark_failed(
+                    execution_request_id,
+                    output=getattr(exc, "output", "") or "",
+                    exit_code=getattr(exc, "exit_code", None),
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+            finally:
+                self._external_prepared_request_id = None
+                self._external_prepared_target = None
+                self._external_prepared_command = None
+            return self._external_execution_result(row, duplicate=False)
+
+    @staticmethod
+    def _external_execution_result(row, duplicate=False):
+        return {
+            "execution_request_id": row["execution_request_id"],
+            "prepared_request_id": row["prepared_request_id"],
+            "target": row["target"],
+            "command_hash": row["command_hash"],
+            "state": row["state"],
+            "started_at": row.get("started_at"),
+            "finished_at": row.get("finished_at"),
+            "output": row.get("output") or "",
+            "exit_code": row.get("exit_code"),
+            "error_type": row.get("error_type"),
+            "error_message": row.get("error_message"),
+            "duplicate": bool(duplicate),
+            "enter_sent": row["state"] in ("EXECUTING", "FINISHED", "FAILED"),
+        }
+
+    def has_active_command(self):
+        status = self.terminals.status()
+
+        if any(
+            bool((status.get(name) or {}).get("executing"))
+            for name in ("powershell", "cmd", "ssh")
+        ):
+            return True
+
+        if (
+            status.get("active_target")
+            or status.get("prepared_target")
+            or self.engine.active_job_id
+        ):
+            return True
+
+        with self._phase5b_lock:
+            execution_id = (
+                self._phase5b_active_execution_id
+            )
+
+        if execution_id:
+            try:
+                row = self.execution_ledger.get(
+                    execution_id
+                )
+                if row.get("state") in (
+                    "CREATED",
+                    "RUNNING",
+                ):
+                    return True
+            except Exception:
+                return True
+
+        return False
+
+    def request_graceful_stop(self):
+        if not self.has_active_command():
+            return {
+                "requested": False,
+                "reason": "no_active_command",
+                "turn_control":
+                    self.chatgpt_timer.turn_control(),
+            }
+
+        result = (
+            self.chatgpt_timer.request_manual_wrap_up(
+                "manual_stop_button"
+            )
+        )
+        return {
+            "requested": True,
+            "already_requested": not bool(
+                result.get("applied")
+            ),
+            "turn_control": result.get(
+                "turn_control"
+            ),
+        }
+
+    def force_stop_active(self):
+        status = self.terminals.status()
+        executing = any(
+            bool((status.get(name) or {}).get("executing"))
+            for name in ("powershell", "cmd", "ssh")
+        )
+        # Durante execute_prepared o prepared_target continua preenchido.
+        # Execucao ativa precisa receber Ctrl+C, nunca descarte de linha.
+        if executing:
+            return bool(self.terminals.cancel_active())
+        if status.get("prepared_target") and self._external_prepared_request_id:
+            result = self.discard_external(self._external_prepared_request_id)
+            return bool(result.get("discarded"))
+        if status.get("active_target"):
+            return bool(self.terminals.cancel_active())
+        return bool(self.engine.cancel(None))
+
+    def stop_active(self):
+        # Mantem a semantica antiga para /v1/stop e chamadas
+        # explicitas de cancelamento imediato.
+        return self.force_stop_active()
+
+    def approve(self, job_id):
+        job = self.store.approve(job_id)
+        self.engine.wake()
+        return job
+
+    def cancel(self, job_id):
+        return self.engine.cancel(job_id)
+
+    def _runtime_has_terminal_owner(self):
+        if self.engine.active_job_id:
+            return True
+
+        with self._phase5b_lock:
+            if any(
+                worker.is_alive()
+                for worker in getattr(self, "_phase5b_workers", {}).values()
+            ):
+                return True
+
+            active_v2 = self._phase5b_active_execution_id
+
+        if active_v2:
+            try:
+                row = self.execution_ledger.get(active_v2)
+            except Exception:
+                row = None
+
+            if row and row.get("state") in ("CREATED", "RUNNING"):
+                return True
+
+        if self._external_prepared_request_id:
+            return True
+
+        with self._external_workers_lock:
+            if any(
+                worker.is_alive()
+                for worker in self._external_workers.values()
+            ):
+                return True
+
+        return False
+
+    def _recover_orphaned_terminal_state(self, terminals):
+        if self._runtime_has_terminal_owner():
+            return terminals
+
+        stale_targets = set()
+
+        target_map = {
+            "powershell": "POWERSHELL5.1",
+            "cmd": "CMD",
+            "ssh": "SSH",
+        }
+
+        for key, target in target_map.items():
+            state = terminals.get(key) or {}
+            if state.get("executing"):
+                stale_targets.add(target)
+
+        active = terminals.get("active_target")
+        prepared = terminals.get("prepared_target")
+
+        if active:
+            stale_targets.add(active)
+        if prepared:
+            stale_targets.add(prepared)
+
+        if stale_targets:
+            self.external_executions.recover_orphaned(
+                self.instance_id
+            )
+            self.external_prepares.recover_orphaned(
+                self.instance_id
+            )
+
+            for row in self.execution_ledger.list_by_state(
+                "CREATED",
+                "RUNNING",
+            ):
+                if (
+                    row.get("runtime_instance")
+                    == self.instance_id
+                ):
+                    try:
+                        self.execution_ledger.transition(
+                            row["execution_id"],
+                            "INTERRUPTED",
+                            runtime_instance=self.instance_id,
+                            error_type=(
+                                "ExecutionOrphanedStateRecovered"
+                            ),
+                            error_message=(
+                                "estado sem worker ativo; "
+                                "terminal reciclado"
+                            ),
+                        )
+                    except Exception:
+                        pass
+
+            self._external_prepared_request_id = None
+            self._external_prepared_target = None
+            self._external_prepared_command = None
+
+            with self._phase5b_lock:
+                self._phase5b_active_execution_id = None
+
+            for target in sorted(stale_targets):
+                if target in ("POWERSHELL5.1", "CMD"):
+                    self.terminals.recycle(
+                        target,
+                        reason="estado sem owner ativo",
+                    )
+                else:
+                    self.terminals.recover_orphaned(
+                        target,
+                        reason="estado sem owner ativo",
+                    )
+
+            return self.terminals.status()
+
+        self.terminals.ensure_local_online()
+        return self.terminals.status()
+
+    def snapshot(self):
+        terminals = self.terminals.status()
+        terminals = self._recover_orphaned_terminal_state(
+            terminals
+        )
+        counts = self.store.counts()
+        availability = self._availability_status()
+        author_mcp = availability["author_mcp"]
+        secure_tunnel = availability["secure_tunnel"]
+        overall = (
+            "READY"
+            if terminals["powershell"]["online"]
+            and terminals["cmd"]["online"]
+            else "DEGRADED"
+        )
+        with self._phase5b_lock:
+            v2_active_execution_id = (
+                self._phase5b_active_execution_id
+            )
+            v2_active = (
+                self.execution_ledger.get(
+                    v2_active_execution_id
+                )
+                if v2_active_execution_id
+                else None
+            )
+            v2_command = getattr(self, "_phase5b_active_command", None)
+            if not v2_command or v2_command[0] != v2_active_execution_id:
+                v2_command = None
+
+        return {
+            "app": APP_NAME,
+            "version": APP_VERSION,
+            "overall": overall,
+            "author_mcp": author_mcp,
+            "secure_tunnel": secure_tunnel,
+            "api": {
+                "online": self.api.running,
+                "host": self.api.host,
+                "port": self.api.port,
+            },
+            "terminals": terminals,
+            "auto_execute": bool(self.auto_execute),
+            "completion_sound": {
+                "enabled": bool(
+                    self.completion_sound.enabled
+                ),
+            },
+            "queue": counts,
+            "executor": {
+                "running": self.engine.running,
+                "active_job_id": self.engine.active_job_id,
+            },
+            "active_execution": (
+                {
+                    "execution_id": v2_active["execution_id"],
+                    "state": v2_active["state"],
+                    "target": v2_active["target"],
+                    "command": v2_command[1] if v2_command else None,
+                    "started_at": v2_command[2] if v2_command else None,
+                }
+                if v2_active is not None
+                else None
+            ),
+            "chatgpt_timer": self.chatgpt_timer.snapshot(),
+            "rag_queries": self.rag_query_counts(),
+            "turn_control": self.chatgpt_timer.turn_control(),
+            "turn_timer_mode": getattr(
+                self, "turn_timer_mode", DEFAULT_TURN_TIMER_MODE
+            ),
+            "claude_watcher": self.claude_watcher.status(),
+            "chatgpt_companion": {
+                "online": self.chatgpt_companion.running,
+                "host": self.chatgpt_companion.host,
+                "port": self.chatgpt_companion.port,
+            },
+        }
+
+    def _commit_pending_rag_changes(self):
+        """Exclusoes/ativacoes do RAG que ainda davam para desfazer viram definitivas."""
+        try:
+            import sys
+            root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            if root not in sys.path:
+                sys.path.insert(0, root)
+            from rag.runtime.knowledge_deletion_operational import commit_pending_changes
+            return commit_pending_changes()
+        except Exception:
+            return []
+
+    def stop(self):
+        if not self._started:
+            return True
+
+        self._invalidate_availability_cache()
+        self._commit_pending_rag_changes()
+        try:
+            self.claude_watcher.stop()
+        except Exception:
+            pass
+        try:
+            self.secure_tunnel.stop()
+        finally:
+            try:
+                self.author_mcp.stop()
+            finally:
+                try:
+                    self.chatgpt_companion.stop()
+                finally:
+                    try:
+                        self.api.stop()
+                    finally:
+                        try:
+                            self.engine.stop(wait=True, timeout=5)
+                        finally:
+                            try:
+                                self.terminals.close()
+                            finally:
+                                pass
+
+        self._started = False
+        self._invalidate_availability_cache()
+        try:
+            RUNTIME_FILE.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return True

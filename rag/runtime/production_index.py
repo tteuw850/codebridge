@@ -1,0 +1,226 @@
+"""Staged, isolated indexing executor; publication belongs to RAG-017-H."""
+from __future__ import annotations
+
+from pathlib import Path
+import os
+import shutil
+import sqlite3
+from uuid import uuid4
+
+from rag.chunking import chunk_markdown, chunk_text_log, safe_chunk_code
+from rag.chunking.bounded import (
+    CODE_INDEX_MAX_CHARS, TEXT_INDEX_MAX_CHARS, bound_index_chunks,
+)
+from rag.chunking.provenance import source_sha256
+from rag.contracts import SourceType
+from rag.index.fts5 import initialize_fts5
+from rag.index.sqlite_schema import connect_rag_index
+from rag.index.vector_ids import deterministic_document_id, deterministic_chunk_id
+from rag.runtime.index_request import RagIndexPlan
+from rag.runtime.status import resolve_rag_sqlite_path
+
+
+# Smaller indexing batches reduce llama.cpp allocation pressure on 8 GB Windows.
+CODE_INDEX_UBATCH_TOKENS = 32
+
+
+def _drafts(path: str, content: str, code: bool):
+    if code:
+        result = safe_chunk_code(content, path=path)
+        originals = result.structural_chunks or result.fallback_chunks
+        return bound_index_chunks(originals, max_chars=CODE_INDEX_MAX_CHARS)
+    originals = (
+        chunk_markdown(content)
+        if Path(path).suffix.lower() == ".md"
+        else chunk_text_log(content)
+    )
+    return bound_index_chunks(originals, max_chars=TEXT_INDEX_MAX_CHARS)
+
+
+def _source_type(path: str, code: bool) -> SourceType:
+    if code:
+        return SourceType.CODE
+    if Path(path).suffix.lower() in (".txt",".log"):
+        return SourceType.LOG
+    return SourceType.DOCUMENTATION
+
+
+def build_staged_index(plan: RagIndexPlan, *, isolated_staging_parent: Path | None = None) -> dict[str, object]:
+    """Build a complete project-specific staging corpus and vectors, never publish it."""
+    if not isinstance(plan, RagIndexPlan):
+        raise ValueError("plan must be RagIndexPlan")
+    root=Path(plan.project_root).resolve()
+    from rag.sources.git_state import capture_git_head_state, GitStateError
+    try:
+        git_state=capture_git_head_state(root)
+    except GitStateError:
+        git_state=None
+    branch=git_state.branch if git_state else None
+    commit=git_state.head_commit if git_state else None
+    state=resolve_rag_sqlite_path().parent
+    if isolated_staging_parent is None:
+        staging_parent = state / "staging"
+    else:
+        staging_parent = Path(isolated_staging_parent).resolve(strict=True)
+        if (not staging_parent.is_dir() or
+                staging_parent.is_relative_to(state.resolve()) or
+                state.resolve().is_relative_to(staging_parent) or
+                staging_parent == root or staging_parent.is_relative_to(root) or
+                staging_parent.is_symlink()):
+            raise ValueError("isolated staging must remain outside production and source roots")
+    staging=staging_parent/("build-"+uuid4().hex)
+    staging.mkdir(parents=True, exist_ok=False)
+    db_path=staging/"rag_index.sqlite3"
+    connection=connect_rag_index(db_path)
+    documents=chunks=0
+    try:
+        for candidate in plan.candidates:
+            path=(root/candidate.path).resolve()
+            if not path.is_relative_to(root) or not path.is_file():
+                raise ValueError("index candidate escaped or disappeared from project")
+            # Recheck security immediately before writing each source.
+            from rag.sources.exclusion_policy import classify_denied_path
+            from rag.sources.secret_detection import scan_sensitive_content
+            if classify_denied_path(candidate.path) is not None:
+                raise ValueError("denied source in index plan")
+            content=path.read_text(encoding="utf-8",errors="replace")
+            if scan_sensitive_content(content,max_findings=1).sensitive:
+                raise ValueError("sensitive source changed since plan creation")
+            code=candidate.code_eligible
+            source=_source_type(candidate.path,code)
+            did=deterministic_document_id(plan.project_id,source,candidate.path)
+            sha=source_sha256(content)
+            connection.execute(
+                "INSERT INTO rag_documents(document_id,project_id,source_type,content,path,sha256,git_branch,git_commit) VALUES(?,?,?,?,?,?,?,?)",
+                (did,plan.project_id,source.value,content,candidate.path,sha,branch,commit),
+            )
+            documents+=1
+            for draft in _drafts(candidate.path,content,code):
+                cid=deterministic_chunk_id(did,int(draft.ordinal),draft.content)
+                connection.execute(
+                    "INSERT INTO rag_chunks(chunk_id,document_id,project_id,ordinal,content,source_type,path,line_start,line_end,sha256,git_branch,git_commit) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (cid,did,plan.project_id,int(draft.ordinal),draft.content,source.value,candidate.path,getattr(draft,"line_start",None),getattr(draft,"line_end",None),sha,branch,commit),
+                )
+                chunks+=1
+        connection.commit()
+        initialize_fts5(connection,rebuild=True)
+        connection.commit()
+        text_rows=connection.execute(
+            "SELECT chunk_id,document_id,content,source_type,path,line_start,line_end,sha256,git_branch,git_commit FROM rag_chunks WHERE source_type != 'CODE' ORDER BY document_id,ordinal"
+        ).fetchall()
+        code_rows=connection.execute(
+            "SELECT chunk_id,document_id,content,source_type,path,line_start,line_end,sha256,git_branch,git_commit FROM rag_chunks WHERE source_type = 'CODE' ORDER BY document_id,ordinal"
+        ).fetchall()
+        connection.close()
+        connection=None
+        from rag.runtime.production_search import _MODEL_LOCK
+        with _MODEL_LOCK:
+            _write_vectors(staging/"qdrant",plan.project_id,text_rows,code_rows)
+        manifest = None
+        # Incremental merge requires model-compatible entries from the
+        # existing active manifest. Fresh standalone staging keeps its old API.
+        from rag.runtime.status import resolve_rag_manifest_path
+        if resolve_rag_manifest_path().is_file():
+            from rag.index.manifest import load_index_manifest
+            active = load_index_manifest(resolve_rag_manifest_path())
+            if any(item.project_id == plan.project_id for item in active.entries):
+                from rag.runtime.staged_manifest import create_staged_manifest
+                manifest = create_staged_manifest(staging, root, plan.project_id)
+        return {"state":"STAGED_NOT_PUBLISHED","project_id":plan.project_id,"staging_path":str(staging),"documents":documents,"chunks":chunks,"text_chunks":len(text_rows),"code_chunks":len(code_rows),"manifest_entries":manifest["entries"] if manifest else None}
+    except BaseException:
+        if connection is not None:
+            connection.close()
+            connection = None
+        shutil.rmtree(staging,ignore_errors=True)
+        raise
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _write_vectors(path: Path, project_id: str, text_rows, code_rows, *, text_cpu_only: bool = False) -> None:
+    from qdrant_client import models
+    from rag.index.qdrant_local import (
+        open_qdrant_local,close_qdrant_local,ensure_vector_collections,
+        TEXT_VECTOR_COLLECTION,CODE_VECTOR_COLLECTION,
+    )
+    from rag.index.vector_ids import deterministic_vector_point_id
+    from rag.index.vector_namespace import vector_payload_with_namespace
+    from rag.models.artifact_install import resolve_selected_model_path
+    from rag.models.code_artifact_install import resolve_selected_code_model_path
+    from rag.models.embedding import TextEmbeddingClient
+    from rag.models.code_embedding import CodeEmbeddingClient,CodeRetrievalTask
+    from rag.models.lifecycle import LlamaServerConfig, TextModelLifecycle
+    from rag.models.code_lifecycle import CodeModelLifecycle,build_code_server_config
+    from rag.models.backend_policy import TEXT_SEARCH_CONTEXT_TOKENS, TEXT_SEARCH_UBATCH_TOKENS
+    from rag.models.code_backend_policy import (
+        CODE_SEARCH_CONTEXT_TOKENS, CODE_SEARCH_PARALLEL_SLOTS,
+    )
+    from rag.models.fallback import TextModelFallbackManager, build_cpu_fallback_config, manager_for_compute
+    from rag.models.compute_preference import load_compute
+
+    client=open_qdrant_local(path)
+    from rag.llama_binary import llama_server_path
+    llama=llama_server_path()  # mesma copia de todas as IAs
+    try:
+        ensure_vector_collections(client)
+        for rows,collection in ((text_rows,TEXT_VECTOR_COLLECTION),(code_rows,CODE_VECTOR_COLLECTION)):
+            if not rows:
+                continue
+            if collection==TEXT_VECTOR_COLLECTION:
+                text_config=LlamaServerConfig(
+                    executable_path=llama,
+                    model_path=resolve_selected_model_path(),
+                    port=0, gpu_layers=99, device="CUDA0",
+                    context_size=TEXT_SEARCH_CONTEXT_TOKENS,
+                    ubatch_size=TEXT_SEARCH_UBATCH_TOKENS,
+                    parallel_slots=1,
+                )
+                manager=(
+                    TextModelFallbackManager(
+                        gpu_config=None,
+                        cpu_config=build_cpu_fallback_config(text_config),
+                        selected_gpu_device=None,
+                        lifecycle_factory=TextModelLifecycle,
+                        gpu_unavailable_reason="isolated auto-index TEXT CPU policy",
+                    )
+                    if text_cpu_only else manager_for_compute(text_config)
+                )
+                manager.load(timeout_seconds=90)
+                life=manager.active_lifecycle
+            else:
+                gpu_config=build_code_server_config(
+                    executable_path=llama,
+                    model_path=resolve_selected_code_model_path(),
+                    port=0, gpu_layers=99, device="CUDA0",
+                    context_size=CODE_SEARCH_CONTEXT_TOKENS,
+                    ubatch_size=CODE_INDEX_UBATCH_TOKENS,
+                    parallel_slots=CODE_SEARCH_PARALLEL_SLOTS,
+                )
+                compute=load_compute()  # chave CPU/GPU/Automatico do CodeBridge
+                manager=(TextModelFallbackManager(
+                    gpu_config=gpu_config,
+                    cpu_config=build_cpu_fallback_config(gpu_config),
+                    selected_gpu_device="CUDA0",
+                    lifecycle_factory=CodeModelLifecycle)
+                    if compute=="AUTO" else
+                    manager_for_compute(gpu_config, compute=compute, lifecycle_factory=CodeModelLifecycle))
+                manager.load(timeout_seconds=90)
+                life=manager.active_lifecycle
+            try:
+                embed=TextEmbeddingClient(life) if collection==TEXT_VECTOR_COLLECTION else CodeEmbeddingClient(life)
+                batch=[]
+                for row in rows:
+                    vector=(embed.embed_document(row[2]).values if collection==TEXT_VECTOR_COLLECTION
+                            else embed.embed_passage(CodeRetrievalTask.NL2CODE,row[2]).values)
+                    payload=vector_payload_with_namespace(project_id,{"document_id":row[1],"content":row[2],"source_type":row[3],"path":row[4],"line_start":row[5],"line_end":row[6],"sha256":row[7],"chunk_id":row[0],"git_branch":row[8],"git_commit":row[9]})
+                    batch.append(models.PointStruct(id=deterministic_vector_point_id(project_id,collection,row[0]),vector=list(vector),payload=payload))
+                    if len(batch)>=64:
+                        client.upsert(collection_name=collection,points=batch,wait=True)
+                        batch=[]
+                if batch:
+                    client.upsert(collection_name=collection,points=batch,wait=True)
+            finally:
+                manager.unload(timeout_seconds=15)
+    finally:
+        close_qdrant_local(client)

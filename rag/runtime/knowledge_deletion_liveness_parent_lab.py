@@ -1,0 +1,183 @@
+"""DQ-E-D-3C-E-2: TEMP-only parent owns Win32 locks and child pipe.
+
+Parent launch is solely for subprocess tests. It does not contact an installed
+MCP, run models, or authorize generation cutover/deletion.
+"""
+from __future__ import annotations
+
+from hashlib import sha256
+import json
+import os
+import secrets
+from pathlib import Path
+import subprocess
+import sys
+from threading import Thread
+from unittest.mock import patch
+
+from rag.runtime.knowledge_deletion_bounded_catalog_lab import _validated_scratch_catalog
+from rag.runtime.knowledge_deletion_private_read_session_lab import private_read_session_lab
+from rag.runtime.knowledge_deletion_pin_ipc_lab import envelope_from_private_lab_pin
+from rag.runtime.knowledge_deletion_semantic_request_lab import PinnedSemanticRequestV1
+from rag.runtime.knowledge_deletion_vector_tree_receipt_lab import create_vector_tree_receipt_lab
+from rag.runtime.production_generation_lock import production_generation_lock
+from rag.runtime.knowledge_deletion_parent_identity_lab import (
+    current_process_creation_filetime_lab,
+)
+
+
+def _read_parent_confirmation_bounded(seconds: float = 6.0) -> str | None:
+    lines: list[str] = []
+    def read():
+        lines.append(sys.stdin.readline(100))
+    thread=Thread(target=read,daemon=True)
+    thread.start()
+    thread.join(seconds)
+    if thread.is_alive():
+        return None
+    return lines[0] if lines else ""
+
+
+def _read_child_line_bounded(stream, *, seconds: float = 7.0) -> str:
+    """Bounded read while parent holds locks; kill the child on timeout.
+
+    The caller owns the subprocess and must kill/reap it in its finally block.
+    """
+    lines: list[str] = []
+    errors: list[BaseException] = []
+
+    def read() -> None:
+        try:
+            lines.append(stream.readline(8193))
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread=Thread(target=read,daemon=True)
+    thread.start()
+    thread.join(seconds)
+    if thread.is_alive():
+        raise RuntimeError("scratch child output timed out")
+    if errors:
+        raise RuntimeError("scratch child output unreadable") from errors[0]
+    if not lines or not lines[0] or len(lines[0])>8192:
+        raise RuntimeError("scratch child output missing or oversized")
+    return lines[0]
+
+
+def validate_supervised_scratch_response_lab(
+    body, request, receipt, challenge_digest: str,
+) -> None:
+    """Exact response correlation; no operational credentials are produced."""
+    expected = {
+        "state": "LAB_CHILD_COMPLETED_WHILE_PARENT_PIPE_OPEN",
+        "project_id": request.pin.project_id,
+        "generation_id": request.pin.generation_id,
+        "nonce": request.pin.nonce,
+        "request_sha256": request.request_digest(),
+        "tree_sha256": receipt.tree_sha256,
+        "challenge_sha256": challenge_digest,
+        "operational_use_allowed": False,
+        "activation_authorized": False,
+    }
+    if type(body) is not dict or body != expected:
+        raise RuntimeError("scratch supervised worker response mismatch")
+
+
+def main() -> None:
+    allowed_hangs={"--lab-hang-before-ready":"before-ready",
+                   "--lab-hang-after-ready":"after-ready"}
+    if len(sys.argv) not in (2,3) or (
+        len(sys.argv)==3 and sys.argv[2] not in allowed_hangs
+    ):
+        raise PermissionError("only trusted scratch parent arguments allowed")
+    hang=allowed_hangs.get(sys.argv[2]) if len(sys.argv)==3 else None
+    catalog,root=_validated_scratch_catalog(Path(sys.argv[1])/"project-indexes.json")
+    db=root/"generations"/"private_liveness"/"rag_index.sqlite3"
+    manifest=db.with_name("rag-index-manifest.json")
+    child=None
+    with patch(
+        "rag.runtime.production_generation_lock.resolve_rag_sqlite_path",
+        return_value=root/"CodeBridge"/"rag"/"rag_index.sqlite3",
+    ):
+        with private_read_session_lab(
+            "private-lab",catalog_file=catalog,
+            sqlite_path=db,manifest_path=manifest,
+            generation_guard_factory=lambda:production_generation_lock(
+                exclusive=False,channel="generation",
+            ),
+            semantic_guard_factory=lambda:production_generation_lock(
+                exclusive=True,channel="semantic",
+            ),
+            semantic=True,laboratory_mode=True,operator_approved=True,
+        ) as pin:
+            envelope=envelope_from_private_lab_pin(
+                pin,catalog_file=catalog,laboratory_mode=True,
+            )
+            request=PinnedSemanticRequestV1.parse({
+                "schema_version":1,"pin":envelope.to_payload(),
+                "query":"synthetic liveness","route":"CODE","top_k":1,
+                "source_types":[],"path_filter":None,"branch":None,
+            })
+            receipt=create_vector_tree_receipt_lab(
+                envelope,catalog_file=catalog,laboratory_mode=True,
+            )
+            if not receipt.files:
+                raise RuntimeError("non-empty vector tree required for liveness test")
+            try:
+                args=(
+                    [sys.executable,"-m",
+                     "rag.runtime.knowledge_deletion_hang_worker_lab",hang]
+                    if hang else
+                    [sys.executable,"-m",
+                     "rag.runtime.isolated_project_worker",
+                     "--pinned-scratch-supervised",
+                     str(root),str(os.getpid()),
+                     str(current_process_creation_filetime_lab())]
+                )
+                child=subprocess.Popen(
+                    args,
+                    cwd=str(Path(__file__).resolve().parents[2]),
+                    stdin=subprocess.PIPE,stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,text=True,
+                )
+                child.stdin.write(json.dumps({
+                    "request":request.to_payload(),
+                    "tree_sha256":receipt.tree_sha256,
+                })+"\n")
+                child.stdin.flush()
+                first=_read_child_line_bounded(child.stdout).strip()
+                if first!="CHILD_VERIFIED":
+                    raise RuntimeError("scratch child failed preflight")
+                print("PARENT_READY "+str(child.pid),flush=True)
+                command=_read_parent_confirmation_bounded()
+                if command!="ACK\n":
+                    raise RuntimeError("scratch parent received no ACK")
+                # New independent challenge AFTER the child's preflight;
+                # stale/recorded responses from another session cannot match.
+                challenge=secrets.token_hex(32)
+                child.stdin.write("ACK "+envelope.nonce+" "+challenge+"\n")
+                child.stdin.flush()
+                answer=_read_child_line_bounded(child.stdout)
+                if not answer:
+                    raise RuntimeError("scratch child disappeared before response")
+                body=json.loads(answer)
+                validate_supervised_scratch_response_lab(
+                    body,request,receipt,
+                    sha256(bytes.fromhex(challenge)).hexdigest(),
+                )
+                # No locks released until the response has been validated.
+                if child.wait(timeout=3)!=0:
+                    raise RuntimeError("scratch child completion failed")
+                print("PARENT_CONFIRMED",flush=True)
+            finally:
+                if child is not None:
+                    if child.poll() is None:
+                        child.kill()
+                        child.wait(timeout=3)
+                    for stream in (child.stdin,child.stdout,child.stderr):
+                        if stream is not None:
+                            stream.close()
+
+
+if __name__=="__main__":
+    main()

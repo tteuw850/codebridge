@@ -1,0 +1,547 @@
+import codecs
+import os
+import threading
+import time
+
+from cmd_terminal_session import CmdTerminalSession
+from config_store import ConfigStore
+from credential_store import WindowsCredentialStore
+from linux_terminal_session import LinuxTerminalSession
+from windows_terminal_session import WindowsTerminalSession
+from constants import TERMINAL_ALIASES
+import ssh_host_trust
+from ssh_transfer import TransferRegistry, connect_sftp
+
+
+class TerminalManager:
+    def __init__(self, config_store=None, credential_store=None):
+        self.config = config_store or ConfigStore()
+        self.credentials = credential_store or WindowsCredentialStore()
+        self._lock = threading.RLock()
+        self.windows = WindowsTerminalSession()
+        self.cmd = CmdTerminalSession()
+        self.ssh = None
+        self.ssh_last_error = None
+        self.transfers = TransferRegistry(self.open_sftp)
+        self.active_target = None
+        self._prepared_target = None
+        self._execution_generation = 0
+        self._last_execution_target = None
+        self._raw_streams = {"POWERSHELL5.1": "", "CMD": "", "SSH": ""}
+        self._raw_generation = {"POWERSHELL5.1": 0, "CMD": 0, "SSH": 0}
+        self._raw_base = {"POWERSHELL5.1": 0, "CMD": 0, "SSH": 0}
+        self._raw_limit = 5000000
+        self._recovery_lock = threading.Lock()
+        self._recovering_targets = set()
+        self._raw_decoders = {
+            key: codecs.getincrementaldecoder("utf-8")(errors="replace")
+            for key in self._raw_streams
+        }
+
+    @staticmethod
+    def normalize_target(target):
+        key = str(target).strip().upper()
+        try:
+            return TERMINAL_ALIASES[key]
+        except KeyError as exc:
+            raise ValueError(f"target invalido: {target}") from exc
+
+    def _append_raw(self, target, data):
+        target = self.normalize_target(target)
+        with self._lock:
+            if isinstance(data, bytes):
+                text = self._raw_decoders[target].decode(data, final=False)
+            else:
+                text = str(data)
+            if not text:
+                return
+            value = self._raw_streams[target] + text
+            if len(value) > self._raw_limit:
+                drop = len(value) - self._raw_limit
+                value = value[drop:]
+                self._raw_base[target] += drop
+            self._raw_streams[target] = value
+
+    def raw_delta(self, target, generation, position):
+        target = self.normalize_target(target)
+        with self._lock:
+            current = self._raw_generation[target]
+            value = self._raw_streams[target]
+            base = self._raw_base[target]
+            end = base + len(value)
+            if generation != current or position < base or position > end:
+                return current, end, value, True
+            return current, end, value[position - base:], False
+
+    def _reset_raw(self, target):
+        target = self.normalize_target(target)
+        with self._lock:
+            self._raw_streams[target] = ""
+            self._raw_generation[target] += 1
+            self._raw_base[target] = 0
+            self._raw_decoders[target] = codecs.getincrementaldecoder("utf-8")(errors="replace")
+
+    def _callback(self, target):
+        def callback(data):
+            self._append_raw(target, data)
+        return callback
+    def start(self):
+        # Execucoes automatizadas nunca devem abrir pagers/prompts
+        # interativos que possam assumir o ConPTY.
+        os.environ["GIT_PAGER"] = "cat"
+        os.environ["PAGER"] = "cat"
+        os.environ["GIT_TERMINAL_PROMPT"] = "0"
+
+        self.windows.start(on_output=self._callback("POWERSHELL5.1"), width=120, height=40)
+        self.cmd.start(on_output=self._callback("CMD"), width=120, height=40)
+        ssh_config = self.config.load_ssh()
+        if ssh_config and self.credentials.exists():
+            try:
+                self._connect_saved_ssh(ssh_config)
+            except Exception as exc:
+                self.ssh_last_error = f"{type(exc).__name__}: {exc}"
+        return self.status()
+
+    def _new_ssh_session(self, host, port, username, password):
+        return LinuxTerminalSession(
+            host=host,
+            username=username,
+            password=password,
+            port=int(port),
+            connect_timeout=10,
+        )
+
+    def _connect_saved_ssh(self, ssh_config):
+        credentials = self.credentials.load()
+        if not credentials:
+            return False
+        session = self._new_ssh_session(
+            ssh_config["host"], ssh_config["port"],
+            credentials["username"], credentials["password"],
+        )
+        session.start(on_output=self._callback("SSH"), width=120, height=40)
+        with self._lock:
+            old = self.ssh
+            self.ssh = session
+            self.ssh_last_error = None
+        if old is not None:
+            old.close()
+        return True
+    def ssh_settings(self):
+        config = self.config.load_ssh() or {}
+        credentials = self.credentials.load() or {}
+        with self._lock:
+            ssh = self.ssh
+        return {
+            "host": config.get("host", ""),
+            "port": int(config.get("port", 22)),
+            "username": credentials.get("username", ""),
+            "password_saved": bool(credentials),
+            "online": bool(ssh is not None and ssh.is_running),
+            "last_error": self.ssh_last_error,
+        }
+
+    def open_sftp(self):
+        config = self.config.load_ssh()
+        credentials = self.credentials.load()
+        if not config or not credentials:
+            raise RuntimeError("SSH nao configurado: salve host, login e senha na aba Configuracao SSH")
+        return connect_sftp(config["host"], config["port"],
+                            credentials["username"], credentials["password"])
+
+    def ssh_host_key(self, host, port=22):
+        return ssh_host_trust.check(host, port)
+
+    def trust_ssh_host_key(self, host, port, fingerprint, replace=False):
+        return ssh_host_trust.accept(host, port, fingerprint, replace=replace)
+
+    def test_ssh(self, host, port, username, password):
+        candidate = self._new_ssh_session(host, port, username, password)
+        try:
+            candidate.start(on_output=None, width=120, height=40)
+            return bool(candidate.is_running)
+        finally:
+            candidate.close()
+
+    def configure_ssh(self, host, port, username, password):
+        host = str(host).strip()
+        username = str(username).strip()
+        if not host or not username:
+            raise ValueError("host e login SSH sao obrigatorios")
+        candidate = self._new_ssh_session(host, port, username, password)
+        candidate.start(on_output=self._callback("SSH"), width=120, height=40)
+        try:
+            self.config.save_ssh(host, port)
+            self.credentials.save(username, password)
+        except Exception:
+            candidate.close()
+            raise
+        with self._lock:
+            old = self.ssh
+            self.ssh = candidate
+            self.ssh_last_error = None
+        if old is not None:
+            old.close()
+        return self.ssh_settings()
+
+    def send_input(self, target, data):
+        target = self.normalize_target(target)
+        session = self._ensure_session(target)
+        session.send(data)
+        return True
+
+    def resize(self, target, cols, rows):
+        target = self.normalize_target(target)
+        cols = int(cols)
+        rows = int(rows)
+        # Abas WebEngine ocultas podem reportar tamanhos minimos durante o layout.
+        # Aceitamos terminais estreitos reais, mas descartamos geometria claramente invalida.
+        if cols < 20 or rows < 5:
+            return False
+        session = self._ensure_session(target)
+        session.resize(min(cols, 400), min(rows, 200))
+        return True
+
+    def _ensure_session(self, target):
+        if target == "POWERSHELL5.1":
+            if not self.windows.is_running:
+                self._reset_raw(target)
+                self.windows.start(on_output=self._callback(target), width=120, height=40)
+            return self.windows
+        if target == "CMD":
+            if not self.cmd.is_running:
+                self._reset_raw(target)
+                self.cmd.start(on_output=self._callback(target), width=120, height=40)
+            return self.cmd
+        with self._lock:
+            ssh = self.ssh
+        if ssh is None or not ssh.is_running:
+            config = self.config.load_ssh()
+            if not config or not self.credentials.exists():
+                raise RuntimeError("SSH nao configurado")
+            self._connect_saved_ssh(config)
+            with self._lock:
+                ssh = self.ssh
+        return ssh
+
+    def prepare(self, target, command):
+        target = self.normalize_target(target)
+        with self._lock:
+            if target in getattr(self, "_recovering_targets", set()):
+                raise RuntimeError("terminal em recuperacao")
+        session = self._ensure_session(target)
+        with self._lock:
+            if self.active_target is not None or self._prepared_target is not None:
+                raise RuntimeError("outro comando ja possui autoridade sobre os terminais")
+            self.active_target = target
+            self._prepared_target = target
+        ok = session.prepare_command(command, character_delay=0.0)
+        if not ok:
+            self.discard_prepared()
+            raise RuntimeError("nao foi possivel preparar o comando")
+        return True
+    def execute_prepared(self, target, command, on_output=None):
+        target = self.normalize_target(target)
+        with self._lock:
+            if target in getattr(self, "_recovering_targets", set()):
+                raise RuntimeError("terminal em recuperacao")
+        session = self._ensure_session(target)
+        with self._lock:
+            if self._prepared_target != target:
+                raise RuntimeError("comando nao esta preparado no terminal")
+            self.active_target = target
+            self._execution_generation += 1
+            self._last_execution_target = target
+        try:
+            return session.execute(command, on_output=on_output, prepared=True)
+        finally:
+            with self._lock:
+                self._prepared_target = None
+                self.active_target = None
+
+    def execute(self, target, command):
+        target = self.normalize_target(target)
+        with self._lock:
+            if target in getattr(self, "_recovering_targets", set()):
+                raise RuntimeError("terminal em recuperacao")
+        session = self._ensure_session(target)
+        with self._lock:
+            self.active_target = target
+            self._execution_generation += 1
+            self._last_execution_target = target
+        try:
+            return session.execute(command, on_output=None, prepared=False)
+        finally:
+            with self._lock:
+                self.active_target = None
+
+    def _session_for_target(self, target):
+        if target == "POWERSHELL5.1":
+            return self.windows
+        if target == "CMD":
+            return self.cmd
+        with self._lock:
+            return self.ssh
+
+    def recycle(self, target, reason="recovery"):
+        target = self.normalize_target(target)
+
+        with self._recovery_lock:
+            with self._lock:
+                self._recovering_targets.add(target)
+                if self.active_target == target:
+                    self.active_target = None
+                if self._prepared_target == target:
+                    self._prepared_target = None
+
+            try:
+                if target == "POWERSHELL5.1":
+                    try:
+                        self.windows.close()
+                    finally:
+                        self._reset_raw(target)
+                        self.windows.start(
+                            on_output=self._callback(target),
+                            width=120,
+                            height=40,
+                        )
+
+                elif target == "CMD":
+                    try:
+                        self.cmd.close()
+                    finally:
+                        self._reset_raw(target)
+                        self.cmd.start(
+                            on_output=self._callback(target),
+                            width=120,
+                            height=40,
+                        )
+
+                else:
+                    with self._lock:
+                        old = self.ssh
+                        self.ssh = None
+
+                    if old is not None:
+                        try:
+                            old.close()
+                        except Exception:
+                            pass
+
+                    self._reset_raw(target)
+                    config = self.config.load_ssh()
+
+                    if (
+                        not config
+                        or not self.credentials.exists()
+                    ):
+                        raise RuntimeError(
+                            "SSH nao configurado para recuperacao"
+                        )
+
+                    self._connect_saved_ssh(config)
+                return True
+
+            except Exception as exc:
+                if target == "SSH":
+                    self.ssh_last_error = (
+                        type(exc).__name__
+                        + ": "
+                        + str(exc)
+                    )
+                return False
+
+            finally:
+                with self._lock:
+                    self._recovering_targets.discard(target)
+
+    def _recover_after_cancel(self, target, session):
+        deadline = time.monotonic() + 2.0
+
+        while (
+            session is not None
+            and session.is_executing
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.05)
+
+        with self._lock:
+            current = self._session_for_target(target)
+
+        if current is not session:
+            with self._lock:
+                self._recovering_targets.discard(target)
+            return
+
+        self.recycle(
+            target,
+            reason="cancelamento confirmado/forcado",
+        )
+
+    def recover_orphaned(self, target, reason="orphaned_state"):
+        target = self.normalize_target(target)
+        with self._lock:
+            if target in getattr(self, "_recovering_targets", set()):
+                return False
+            self._recovering_targets.add(target)
+
+        worker = threading.Thread(
+            target=self.recycle,
+            args=(target, reason),
+            name="CodeBridge-Recover-" + target.replace(".", ""),
+            daemon=True,
+        )
+        worker.start()
+        return True
+
+    def ensure_local_online(self):
+        with self._lock:
+            busy = bool(
+                self.active_target
+                or self._prepared_target
+                or self._recovering_targets
+            )
+
+        if busy:
+            return False
+
+        recovered = False
+
+        if not self.windows.is_running:
+            recovered = (
+                self.recycle(
+                    "POWERSHELL5.1",
+                    reason="sessao local offline",
+                )
+                or recovered
+            )
+
+        if not self.cmd.is_running:
+            recovered = (
+                self.recycle(
+                    "CMD",
+                    reason="sessao local offline",
+                )
+                or recovered
+            )
+
+        return recovered
+
+    def discard_prepared(self):
+        with self._lock:
+            target = self._prepared_target
+            self._prepared_target = None
+            self.active_target = None
+        if target is None:
+            return False
+        if target == "POWERSHELL5.1" and self.windows.is_running:
+            self.windows.send(b"\x1b[21~")
+        elif target == "CMD" and self.cmd.is_running:
+            self.cmd.send(b"\x1b")
+        elif target == "SSH" and self.ssh is not None and self.ssh.is_running:
+            self.ssh.send(b"\x15")
+        return True
+
+    def cancel_active(self):
+        with self._lock:
+            target = self.active_target
+            prepared = self._prepared_target
+            ssh = self.ssh
+
+        # Depois de Ctrl+C nao confiamos que um programa interativo
+        # devolveu o prompt. O terminal afetado entra em RECOVERING e
+        # sera reciclado antes de aceitar outro comando.
+        session = None
+
+        if target == "POWERSHELL5.1" and self.windows.is_executing:
+            session = self.windows
+        elif target == "CMD" and self.cmd.is_executing:
+            session = self.cmd
+        elif target == "SSH" and ssh is not None and ssh.is_executing:
+            session = ssh
+
+        if session is not None:
+            with self._lock:
+                self._recovering_targets.add(target)
+
+            try:
+                cancelled = bool(
+                    session.cancel_current()
+                )
+            except Exception:
+                with self._lock:
+                    self._recovering_targets.discard(target)
+                raise
+
+            if not cancelled:
+                with self._lock:
+                    self._recovering_targets.discard(target)
+                return False
+
+            worker = threading.Thread(
+                target=self._recover_after_cancel,
+                args=(target, session),
+                name=(
+                    "CodeBridge-CancelRecovery-"
+                    + target.replace(".", "")
+                ),
+                daemon=True,
+            )
+            worker.start()
+            return True
+
+        if prepared is not None:
+            return self.discard_prepared()
+
+        return False
+
+    def status(self):
+        with self._lock:
+            ssh = self.ssh
+            active = self.active_target
+            prepared = self._prepared_target
+            recovering = set(getattr(self, "_recovering_targets", set()))
+            execution_generation = (
+                self._execution_generation
+            )
+            last_execution_target = (
+                self._last_execution_target
+            )
+        return {
+            "powershell": {
+                "online": bool(self.windows.is_running),
+                "executing": bool(self.windows.is_executing),
+                "recovering": "POWERSHELL5.1" in recovering,
+            },
+            "cmd": {
+                "online": bool(self.cmd.is_running),
+                "executing": bool(self.cmd.is_executing),
+                "recovering": "CMD" in recovering,
+            },
+            "ssh": {
+                "configured": bool(self.config.load_ssh() and self.credentials.exists()),
+                "online": bool(ssh is not None and ssh.is_running),
+                "executing": bool(ssh is not None and ssh.is_executing),
+                "recovering": "SSH" in recovering,
+                "last_error": self.ssh_last_error,
+            },
+            "active_target": active,
+            "prepared_target": prepared,
+            "execution_generation": execution_generation,
+            "last_execution_target": last_execution_target,
+        }
+
+    def close(self):
+        try:
+            if self.windows.is_running:
+                self.windows.close()
+        finally:
+            try:
+                if self.cmd.is_running:
+                    self.cmd.close()
+            finally:
+                with self._lock:
+                    ssh = self.ssh
+                    self.ssh = None
+                if ssh is not None:
+                    ssh.close()

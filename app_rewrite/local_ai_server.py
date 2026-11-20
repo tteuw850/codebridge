@@ -1,0 +1,468 @@
+"""IA Local: ciclo de vida do llama-server (Qwen2.5-Coder) controlado pelo CodeBridge.
+
+O servidor roda como processo filho, so em 127.0.0.1, com chave aleatoria.
+Modos: ON (fica carregado), OFF (libera a memoria), ON_DEMAND (carrega na
+primeira mensagem e desliga sozinho apos IDLE_SECONDS sem uso).
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import secrets
+import socket
+import subprocess
+import threading
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+AI_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "CodeBridge" / "ai"
+DEFAULT_MODEL_FILE = AI_DIR / "models" / "qwen2.5-coder-7b-instruct-q4_k_m.gguf"
+# Modelo escolhido pelo instalador das IAs (ai_setup.py) conforme a memoria da maquina.
+MODEL_CHOICE_FILE = AI_DIR / "model.json"
+
+
+def model_name_for(path) -> str:
+    """'qwen2.5-coder-3b-instruct-q4_k_m.gguf' -> 'Qwen2.5-Coder 3B'."""
+    match = re.search(r"coder-(\d+(?:\.\d+)?)b", Path(path).name.lower())
+    return "Qwen2.5-Coder %sB" % match.group(1) if match else Path(path).stem
+
+
+def selected_model(choice=None, default=None) -> Path:
+    """O .gguf gravado em model.json pelo instalador das IAs; sem escolha, o Qwen 7B."""
+    default = Path(default or DEFAULT_MODEL_FILE)
+    try:
+        data = json.loads(Path(choice or MODEL_CHOICE_FILE).read_text(encoding="utf-8"))
+        chosen = Path(str(data["file"]))
+    except (OSError, ValueError, KeyError, TypeError):
+        return default
+    return chosen if chosen.is_absolute() else default.parent / chosen
+
+
+MODEL_FILE = selected_model()
+MODEL_NAME = model_name_for(MODEL_FILE)
+try:  # uma copia so do llama-server para todas as IAs (rag/llama_binary.py)
+    from rag.llama_binary import llama_server_path as _shared_llama_server
+except Exception:  # pragma: no cover - rag fora do caminho
+    _shared_llama_server = None
+OWN_SERVER_EXE = AI_DIR / "bin" / "llama-server.exe"  # so se a copia compartilhada faltar
+
+
+def resolve_server_exe() -> Path:
+    """A copia compartilhada (a mesma da Central RAG); a propria so como reserva."""
+    if _shared_llama_server is not None:
+        shared = Path(_shared_llama_server())
+        if shared.is_file():
+            return shared
+    return OWN_SERVER_EXE
+
+
+SERVER_EXE = resolve_server_exe()
+SETTINGS_FILE = AI_DIR / "settings.json"
+LOG_FILE = AI_DIR / "logs" / "llama-server.log"
+PID_FILE = AI_DIR / "llama-server.pid"
+
+MODES = ("ON", "OFF", "ON_DEMAND")
+DEFAULT_MODE = "ON_DEMAND"
+IDLE_SECONDS = 600
+CONTEXT_TOKENS = 8192
+START_TIMEOUT_SECONDS = 180
+# Pesos (4,4 GB) + cache de contexto 8k + buffers. Abaixo disso o modelo nao cabe.
+REQUIRED_FREE_VRAM_MB = 5000
+REQUIRED_FREE_RAM_MB = 800
+# No processador o modelo inteiro fica na RAM (pesos + contexto + folga).
+REQUIRED_FREE_RAM_CPU_MB = 6000
+# Outros tamanhos do Qwen: tamanho do .gguf + a mesma folga (7B: 5000 e 6000 MB).
+VRAM_OVERHEAD_MB = 534
+CPU_OVERHEAD_MB = 1534
+
+# Chave CPU/GPU/Automatico do card "IAs" (mesmo arquivo de rag/models/compute_preference.py).
+COMPUTE_MODES = ("AUTO", "GPU", "CPU")
+COMPUTE_ENV = "CODEBRIDGE_AI_COMPUTE"
+
+STATE_OFF = "OFF"
+STATE_LOADING = "LOADING"
+STATE_READY = "READY"
+STATE_ERROR = "ERROR"
+
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def load_mode(path: Path = SETTINGS_FILE) -> str:
+    try:
+        mode = json.loads(Path(path).read_text(encoding="utf-8")).get("mode")
+    except (OSError, ValueError, AttributeError):
+        return DEFAULT_MODE
+    return mode if mode in MODES else DEFAULT_MODE
+
+
+def save_mode(mode: str, path: Path = SETTINGS_FILE) -> None:
+    if mode not in MODES:
+        raise ValueError("modo invalido: " + str(mode))
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"mode": mode}) + "\n", encoding="utf-8")
+
+
+def compute_file(settings: Path = SETTINGS_FILE) -> Path:
+    return Path(settings).parent / "compute.json"
+
+
+def load_compute(path: Path | None = None) -> str:
+    env = os.environ.get(COMPUTE_ENV)
+    value = env
+    if not env:
+        try:
+            value = json.loads(Path(path or compute_file()).read_text(encoding="utf-8")).get("compute")
+        except (OSError, ValueError, AttributeError):
+            value = None
+    value = str(value or "").strip().upper()
+    return value if value in COMPUTE_MODES else "AUTO"
+
+
+def save_compute(mode: str, path: Path | None = None) -> str:
+    mode = str(mode or "").strip().upper()
+    if mode not in COMPUTE_MODES:
+        raise ValueError("modo de processamento invalido: " + str(mode))
+    path = Path(path or compute_file())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"compute": mode}) + "\n", encoding="utf-8")
+    return mode
+
+
+def installed(model: Path = MODEL_FILE, exe: Path = SERVER_EXE) -> bool:
+    return Path(model).is_file() and Path(exe).is_file()
+
+
+def memory_snapshot() -> dict:
+    """VRAM (nvidia-smi) e RAM (psutil) em MB; campos ausentes ficam None."""
+    info = {"vram_total_mb": None, "vram_used_mb": None,
+            "ram_total_mb": None, "ram_used_mb": None}
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total,memory.used",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=4, creationflags=NO_WINDOW,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            total, used = out.stdout.strip().splitlines()[0].split(",")[:2]
+            info["vram_total_mb"] = int(float(total))
+            info["vram_used_mb"] = int(float(used))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    try:
+        import psutil
+        mem = psutil.virtual_memory()
+        info["ram_total_mb"] = int(mem.total / 1048576)
+        info["ram_used_mb"] = int((mem.total - mem.available) / 1048576)
+    except Exception:
+        pass
+    return info
+
+
+def _free(memory: dict, kind: str):
+    total, used = memory.get(kind + "_total_mb"), memory.get(kind + "_used_mb")
+    return None if total is None or used is None else total - used
+
+
+def choose_device(compute: str, memory: dict, *, need=None) -> tuple[str, str | None]:
+    """("GPU"|"CPU", motivo para nao ligar ou None) conforme a chave do card IAs.
+
+    need = (VRAM livre, RAM livre para o processador) em MB que o modelo escolhido
+    precisa (requirements_for); sem need vale o Qwen 7B.
+    """
+    compute = str(compute or "AUTO").upper()
+    vram_need, cpu_need = need or (REQUIRED_FREE_VRAM_MB, REQUIRED_FREE_RAM_CPU_MB)
+    vram, ram = _free(memory, "vram"), _free(memory, "ram")
+    if compute == "CPU":
+        if ram is not None and ram < cpu_need:
+            return "CPU", ("Memória insuficiente para rodar no processador: livre %s de RAM, precisa %s. "
+                           "Feche programas." % (_gb(ram), _gb(cpu_need)))
+        return "CPU", None
+    if compute == "GPU":
+        if vram is None:
+            return "GPU", ("Modo só GPU: nenhuma placa de vídeo NVIDIA encontrada. "
+                           "Escolha CPU ou Automático no card IAs.")
+        return "GPU", start_blocker(memory, vram_need=vram_need)
+    if vram is not None and vram >= vram_need:
+        return "GPU", start_blocker(memory, vram_need=vram_need)
+    if ram is not None and ram < cpu_need:
+        gpu = ("livre %s na placa de vídeo (precisa %s)" % (_gb(vram), _gb(vram_need))
+               if vram is not None else "sem placa de vídeo NVIDIA")
+        return "CPU", ("Memória insuficiente: %s e %s de RAM para o processador (precisa %s). "
+                       "Feche programas." % (gpu, _gb(ram), _gb(cpu_need)))
+    return "CPU", None
+
+
+def start_blocker(memory: dict, *, model_loaded: bool = False,
+                  vram_need: int = REQUIRED_FREE_VRAM_MB) -> str | None:
+    """Motivo em portugues para nao ligar na placa de video, ou None se ha memoria."""
+    if model_loaded:
+        return None
+    total, used = memory.get("vram_total_mb"), memory.get("vram_used_mb")
+    if total is not None and used is not None:
+        free = total - used
+        if free < vram_need:
+            return ("Memória insuficiente na placa de vídeo: livre %s, precisa %s. "
+                    "Feche programas que usam a placa." % (_gb(free), _gb(vram_need)))
+    total, used = memory.get("ram_total_mb"), memory.get("ram_used_mb")
+    if total is not None and used is not None:
+        free = total - used
+        if free < REQUIRED_FREE_RAM_MB:
+            return ("Memória insuficiente: livre %s de RAM, precisa %s. "
+                    "Feche programas ou pause o RAG." % (_gb(free), _gb(REQUIRED_FREE_RAM_MB)))
+    return None
+
+
+def requirements_for(model) -> tuple[int, int]:
+    """(VRAM livre, RAM livre para o processador) em MB: pesos do .gguf + contexto + folga."""
+    try:
+        size_mb = Path(model).stat().st_size / 1048576
+    except OSError:
+        return REQUIRED_FREE_VRAM_MB, REQUIRED_FREE_RAM_CPU_MB
+    return int(size_mb + VRAM_OVERHEAD_MB), int(size_mb + CPU_OVERHEAD_MB)
+
+
+def _gb(mb) -> str:
+    return ("%.1f GB" % (mb / 1024)).replace(".", ",")
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def build_command(exe: Path, model: Path, port: int, api_key: str,
+                  device: str = "GPU") -> list[str]:
+    on_cpu = str(device).upper() == "CPU"
+    return [
+        str(exe), "-m", str(model),
+        "--host", "127.0.0.1", "--port", str(port),
+        "--api-key", api_key,
+        *(["--device", "none", "-ngl", "0"] if on_cpu else ["-ngl", "99"]),
+        "-c", str(CONTEXT_TOKENS), "--parallel", "1",
+        "--jinja", "--load-mode", "none",
+    ]
+
+
+class LocalAiServer:
+    """Liga, desliga e vigia o llama-server. Seguro para chamar de varias threads."""
+
+    def __init__(self, *, exe: Path = SERVER_EXE, model: Path = MODEL_FILE,
+                 settings: Path = SETTINGS_FILE, popen=subprocess.Popen,
+                 health=None, clock=time.monotonic, memory=memory_snapshot):
+        self.exe, self.model, self.settings = Path(exe), Path(model), Path(settings)
+        self._popen, self._clock, self._memory = popen, clock, memory
+        self._health = health or self._http_health
+        self._lock = threading.RLock()
+        self._proc = None
+        self._log = None
+        self.state = STATE_OFF
+        self.error = ""
+        self.port = 0
+        self.api_key = ""
+        self.mode = load_mode(self.settings)
+        self.busy = False
+        self.device = None  # "GPU" ou "CPU" do processo atual
+        self._last_used = clock()
+        self._generation = 0
+
+    # ---- informacao -------------------------------------------------------
+    @property
+    def base_url(self) -> str:
+        return "http://127.0.0.1:%d" % self.port
+
+    def is_installed(self) -> bool:
+        return installed(self.model, self.exe)
+
+    def is_running(self) -> bool:
+        return self.state in (STATE_LOADING, STATE_READY)
+
+    def idle_seconds_left(self) -> int | None:
+        if self.mode != "ON_DEMAND" or self.state != STATE_READY or self.busy:
+            return None
+        return max(0, int(IDLE_SECONDS - (self._clock() - self._last_used)))
+
+    # ---- controle ---------------------------------------------------------
+    def set_mode(self, mode: str) -> None:
+        if mode not in MODES:
+            raise ValueError("modo invalido: " + str(mode))
+        with self._lock:
+            self.mode = mode
+            save_mode(mode, self.settings)
+            self.touch()
+            if mode == "OFF":
+                self.stop()
+            elif mode == "ON":
+                self.start()
+
+    def reload_paths(self) -> None:
+        """Depois do instalador das IAs: usa o llama-server e o modelo que ele escolheu."""
+        with self._lock:
+            if self.is_running():
+                self.stop()
+            self.exe, self.model = resolve_server_exe(), selected_model()
+            if self.state == STATE_ERROR:
+                self.state, self.error = STATE_OFF, ""
+
+    def touch(self) -> None:
+        self._last_used = self._clock()
+
+    def start(self) -> bool:
+        """Inicia o carregamento em segundo plano. False se nao pode ligar."""
+        with self._lock:
+            if self.is_running():
+                return True
+            if not self.is_installed():
+                self.state, self.error = STATE_ERROR, "Modelo não instalado. Clique em Verificar / Reparar IAs."
+                return False
+            device, blocker = choose_device(load_compute(compute_file(self.settings)), self._memory(),
+                                            need=requirements_for(self.model))
+            if blocker:
+                self.state, self.error = STATE_ERROR, blocker
+                return False
+            self.device = device
+            self._kill_stale()
+            self.port = _free_port()
+            self.api_key = secrets.token_hex(16)
+            LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            self._log = open(LOG_FILE, "ab")
+            try:
+                self._proc = self._popen(
+                    build_command(self.exe, self.model, self.port, self.api_key, device),
+                    stdout=self._log, stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL, creationflags=NO_WINDOW,
+                    cwd=str(self.exe.parent),
+                )
+            except OSError as exc:
+                self._close_log()
+                self.state, self.error = STATE_ERROR, "Não foi possível iniciar: " + str(exc)
+                return False
+            self._write_pid()
+            self.state, self.error = STATE_LOADING, ""
+            self._generation += 1
+            self.touch()
+            threading.Thread(target=self._wait_ready, args=(self._generation,),
+                             name="LocalAiWaitReady", daemon=True).start()
+            return True
+
+    def stop(self) -> None:
+        with self._lock:
+            proc, self._proc = self._proc, None
+            self._generation += 1
+            self.state, self.busy = STATE_OFF, False
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=8)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        self._close_log()
+        try:
+            PID_FILE.unlink()
+        except OSError:
+            pass
+
+    def tick(self) -> None:
+        """Chamado periodicamente: detecta queda do processo e desliga por inatividade."""
+        with self._lock:
+            proc = self._proc
+            if proc is not None and proc.poll() is not None and self.is_running():
+                self._proc = None
+                self._close_log()
+                self.state = STATE_ERROR
+                self.error = "O servidor da IA fechou (código %s). Veja %s" % (proc.returncode, LOG_FILE)
+                return
+            left = self.idle_seconds_left()
+        if left == 0:
+            self.stop()
+
+    def wait_ready(self, timeout: float = START_TIMEOUT_SECONDS, cancelled=None) -> bool:
+        end = self._clock() + timeout
+        while self._clock() < end:
+            if self.state == STATE_READY:
+                return True
+            if self.state in (STATE_OFF, STATE_ERROR):
+                return False
+            if cancelled is not None and cancelled():
+                return False
+            time.sleep(0.25)
+        return self.state == STATE_READY
+
+    # ---- interno ----------------------------------------------------------
+    def _wait_ready(self, generation: int) -> None:
+        end = time.monotonic() + START_TIMEOUT_SECONDS
+        while time.monotonic() < end:
+            with self._lock:
+                if generation != self._generation:
+                    return
+                proc = self._proc
+            if proc is None or proc.poll() is not None:
+                with self._lock:
+                    if generation == self._generation:
+                        self.state = STATE_ERROR
+                        self.error = "O servidor da IA fechou ao carregar. Veja " + str(LOG_FILE)
+                return
+            if self._health(self.port, self.api_key):
+                with self._lock:
+                    if generation == self._generation:
+                        self.state = STATE_READY
+                        self.touch()
+                return
+            time.sleep(0.5)
+        with self._lock:
+            if generation == self._generation:
+                self.error = "A IA demorou demais para carregar."
+        self.stop()
+        self.state = STATE_ERROR
+
+    @staticmethod
+    def _http_health(port: int, api_key: str) -> bool:
+        request = urllib.request.Request(
+            "http://127.0.0.1:%d/health" % port,
+            headers={"Authorization": "Bearer " + api_key},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=2) as response:
+                return response.status == 200
+        except (urllib.error.URLError, OSError, ValueError):
+            return False
+
+    def _close_log(self) -> None:
+        log, self._log = self._log, None
+        if log is not None:
+            try:
+                log.close()
+            except OSError:
+                pass
+
+    def _write_pid(self) -> None:
+        try:
+            PID_FILE.write_text(str(self._proc.pid), encoding="utf-8")
+        except (OSError, AttributeError):
+            pass
+
+    @staticmethod
+    def _kill_stale() -> None:
+        """Encerra um llama-server que sobrou de uma sessao que caiu."""
+        try:
+            pid = int(PID_FILE.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            return
+        try:
+            import psutil
+            proc = psutil.Process(pid)
+            if proc.name().lower().startswith("llama-server"):
+                proc.kill()
+        except Exception:
+            pass
+        try:
+            PID_FILE.unlink()
+        except OSError:
+            pass
